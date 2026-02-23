@@ -1,0 +1,53 @@
+juliet {
+  engine = codex;
+}
+
+policy Preflight = """
+Before each run:
+- validate branch intent and git context
+- verify task/spec artifacts are present
+- confirm operator parameters are explicit
+""";
+
+policy FailureTriage = """
+On failure:
+- summarize failure mode and likely cause
+- attempt one safe retry
+- if retry fails, request operator review with branch/log context
+""";
+
+rubric DeliveryRubric {
+  criterion "Correctness" points 5 means "Behavior matches the requested scope.";
+  criterion "Safety" points 3 means "Branch and failure handling are explicit and safe.";
+  criterion "Traceability" points 2 means "Decisions and outcomes are easy to inspect.";
+  tiebreakers ["Correctness", "Safety"];
+}
+
+cadence DeliveryCadence {
+  engine = codex;
+  variants = 1;
+  sprints = 1;
+  compare using DeliveryRubric;
+  keep best 1;
+}
+
+create ArtifactA from juliet """
+Build ArtifactA first on top of the source branch.
+"""
+with {
+  preflight = Preflight;
+  failureTriage = FailureTriage;
+  cadence = DeliveryCadence;
+  rubric = DeliveryRubric;
+};
+
+create ArtifactB from juliet """
+Build ArtifactB after ArtifactA and incorporate outputs from ArtifactA.
+"""
+using [ArtifactA]
+with {
+  preflight = Preflight;
+  failureTriage = FailureTriage;
+  cadence = DeliveryCadence;
+  rubric = DeliveryRubric;
+};
