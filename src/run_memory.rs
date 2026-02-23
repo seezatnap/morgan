@@ -276,6 +276,7 @@ mod tests {
             keep_best: 1,
             create_prompt: "Ship it".to_string(),
             dependencies: Vec::new(),
+            target_branch: None,
         }
     }
 

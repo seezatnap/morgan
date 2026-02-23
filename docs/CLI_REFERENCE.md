@@ -51,6 +51,7 @@ Key options:
 - `--input-file <path>` repeatable input context files.
 - `--script-output <path>` generated script path.
 - `--artifact-name <name>` create artifact identifier.
+- `--artifact-plan-file <path>` JSON multi-artifact plan (overrides `--artifact-name`).
 - `--engine <codex|claude>` script engine field.
 - `--variants <n>` cadence variants.
 - `--sprints <n>` cadence sprints.
@@ -84,6 +85,28 @@ Key options:
 - `--auto-grade <true|false>` grading prompts behavior.
 - `--juliet-bin <path>` explicit Juliet binary.
 - `--juliet-manifest <path>` Juliet fallback manifest.
+
+Artifact plan JSON format (`--artifact-plan-file`):
+
+```json
+{
+  "artifacts": [
+    {
+      "name": "Phase1",
+      "prompt": "Implement phase 1 only",
+      "input_files": ["prds/phase-1.md"],
+      "dependencies": [],
+      "target_branch": "feature/phase-1"
+    },
+    {
+      "name": "Phase2",
+      "input_files": ["prds/phase-2.md"],
+      "using": ["Phase1"],
+      "target_branch": "feature/phase-2"
+    }
+  ]
+}
+```
 
 ## `execute`
 
@@ -192,6 +215,19 @@ cargo run -- execute \
   --role director-of-engineering \
   --project-name orchestrator \
   --script-path examples/dependent-artifacts.julietscript \
+  --source-branch main \
+  --email you@example.com
+```
+
+Multi-artifact run from artifact plan file:
+
+```bash
+cargo run -- run \
+  --project-root ../juliet \
+  --role director-of-engineering \
+  --project-name orchestrator \
+  --master-prompt "Build and validate the orchestration CLI." \
+  --artifact-plan-file examples/artifact-plan.json \
   --source-branch main \
   --email you@example.com
 ```

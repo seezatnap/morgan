@@ -11,13 +11,21 @@ use crate::engine::Engine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptSpec {
-    pub artifact_name: String,
-    pub master_prompt: String,
-    pub input_context: String,
+    pub artifacts: Vec<ScriptArtifactSpec>,
     pub engine: Engine,
     pub variants: u32,
     pub sprints: u32,
     pub keep_best: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptArtifactSpec {
+    pub artifact_name: String,
+    pub create_prompt: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub target_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +37,8 @@ pub struct ExecutionPlan {
     pub keep_best: u32,
     pub create_prompt: String,
     pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub target_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,11 +61,12 @@ pub fn validate_artifact_name(artifact_name: &str) -> Result<()> {
 }
 
 pub fn generate_script(spec: &ScriptSpec) -> String {
-    let create_prompt = format!(
-        "Master prompt:\\n{}\\n\\nInput context:\\n{}\\n\\nOperational requirements:\\n- Run preflight checks before sprint launches.\\n- Ask for review when a human decision is required.\\n- If branches drift or mismatch, stop and ask for branch clarification before continuing.\\n- Grade sprint results using the rubric before selecting winners.",
-        spec.master_prompt.trim(),
-        spec.input_context.trim()
-    );
+    let create_statements = spec
+        .artifacts
+        .iter()
+        .map(render_create_statement)
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     format!(
         r#"juliet {{
@@ -92,23 +103,66 @@ cadence DeliveryCadence {{
   keep best {keep_best};
 }}
 
-create {artifact_name} from juliet """
-{create_prompt}
-"""
-with {{
-  preflight = Preflight;
-  failureTriage = FailureTriage;
-  cadence = DeliveryCadence;
-  rubric = DeliveryRubric;
-}};
+{create_statements}
 "#,
         engine = spec.engine,
         variants = spec.variants.max(1),
         sprints = spec.sprints.max(1),
         keep_best = spec.keep_best.max(1),
-        artifact_name = spec.artifact_name,
-        create_prompt = escape_block_string(&create_prompt),
+        create_statements = create_statements,
     )
+}
+
+pub fn build_create_prompt(master_prompt: &str, input_context: &str) -> String {
+    format!(
+        "Master prompt:\\n{}\\n\\nInput context:\\n{}\\n\\nOperational requirements:\\n- Run preflight checks before sprint launches.\\n- Ask for review when a human decision is required.\\n- If branches drift or mismatch, stop and ask for branch clarification before continuing.\\n- Grade sprint results using the rubric before selecting winners.",
+        master_prompt.trim(),
+        input_context.trim()
+    )
+}
+
+pub fn validate_target_branch(target_branch: &str) -> Result<()> {
+    let branch = target_branch.trim();
+    if branch.is_empty() {
+        bail!("target branch cannot be empty");
+    }
+    if branch.contains(char::is_whitespace) {
+        bail!(
+            "target branch '{}' is invalid: whitespace is not allowed",
+            target_branch
+        );
+    }
+    if branch.contains(';') {
+        bail!(
+            "target branch '{}' is invalid: ';' is not allowed",
+            target_branch
+        );
+    }
+    Ok(())
+}
+
+fn render_create_statement(artifact: &ScriptArtifactSpec) -> String {
+    let mut statement = format!(
+        "create {} from juliet \"\"\"\n{}\n\"\"\"\n",
+        artifact.artifact_name,
+        escape_block_string(&artifact.create_prompt)
+    );
+    if !artifact.dependencies.is_empty() {
+        statement.push_str(&format!("using [{}]\n", artifact.dependencies.join(", ")));
+    }
+    statement.push_str("with {\n");
+    statement.push_str("  preflight = Preflight;\n");
+    statement.push_str("  failureTriage = FailureTriage;\n");
+    statement.push_str("  cadence = DeliveryCadence;\n");
+    statement.push_str("  rubric = DeliveryRubric;\n");
+    if let Some(target_branch) = &artifact.target_branch {
+        statement.push_str(&format!(
+            "  // morgan.target-branch = {};\n",
+            target_branch.trim()
+        ));
+    }
+    statement.push_str("};");
+    statement
 }
 
 pub fn parse_execution_plan(script: &str) -> Result<ExecutionPlan> {
@@ -130,6 +184,12 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
     let juliet_block_re = Regex::new(r#"(?ms)^\s*juliet\s*\{(?P<body>.*?)\}"#).unwrap();
     let cadence_ref_re =
         Regex::new(r#"(?m)\bcadence\s*=\s*(?P<name>[A-Za-z][A-Za-z0-9_]*)\s*;"#).unwrap();
+    let target_branch_assignment_re = Regex::new(
+        r#"(?m)\btarget_branch\s*=\s*(?P<branch>"(?:\\.|[^"])*"|[A-Za-z0-9._/\-]+)\s*;"#,
+    )
+    .unwrap();
+    let target_branch_comment_re =
+        Regex::new(r#"(?m)//\s*morgan\.target-branch\s*[:=]\s*(?P<branch>[^;\n]+)\s*;?"#).unwrap();
     let masked_script = mask_string_literals(script);
 
     let default_engine = juliet_block_re
@@ -216,6 +276,11 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
         };
 
         let dependencies = parse_dependencies(create_caps.name("using").map(|m| m.as_str()));
+        let target_branch = parse_target_branch(
+            with_body,
+            &target_branch_assignment_re,
+            &target_branch_comment_re,
+        )?;
 
         plans.push(ExecutionPlan {
             artifact_name,
@@ -225,6 +290,7 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
             keep_best: cadence.keep_best,
             create_prompt,
             dependencies,
+            target_branch,
         });
     }
 
@@ -417,6 +483,32 @@ fn parse_dependencies(using_block: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn parse_target_branch(
+    with_body: &str,
+    assignment_re: &Regex,
+    comment_re: &Regex,
+) -> Result<Option<String>> {
+    let raw = assignment_re
+        .captures(with_body)
+        .and_then(|caps| caps.name("branch").map(|m| m.as_str().to_string()))
+        .or_else(|| {
+            comment_re
+                .captures(with_body)
+                .and_then(|caps| caps.name("branch").map(|m| m.as_str().to_string()))
+        });
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let branch = if raw.starts_with('"') {
+        decode_string_literal(&raw)?
+    } else {
+        raw
+    };
+    validate_target_branch(&branch)?;
+    Ok(Some(branch.trim().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,9 +516,12 @@ mod tests {
     #[test]
     fn generated_script_contains_required_blocks() {
         let spec = ScriptSpec {
-            artifact_name: "ShipCLI".to_string(),
-            master_prompt: "Build the release CLI.".to_string(),
-            input_context: "- /tmp/spec.md".to_string(),
+            artifacts: vec![ScriptArtifactSpec {
+                artifact_name: "ShipCLI".to_string(),
+                create_prompt: build_create_prompt("Build the release CLI.", "- /tmp/spec.md"),
+                dependencies: Vec::new(),
+                target_branch: None,
+            }],
             engine: Engine::Codex,
             variants: 3,
             sprints: 2,
@@ -439,6 +534,37 @@ mod tests {
         assert!(script.contains("rubric DeliveryRubric"));
         assert!(script.contains("cadence DeliveryCadence"));
         assert!(script.contains("create ShipCLI from juliet"));
+    }
+
+    #[test]
+    fn generated_script_supports_multiple_create_statements_with_target_branches() {
+        let spec = ScriptSpec {
+            artifacts: vec![
+                ScriptArtifactSpec {
+                    artifact_name: "ArtifactA".to_string(),
+                    create_prompt: "build A".to_string(),
+                    dependencies: Vec::new(),
+                    target_branch: Some("feature/custom-a".to_string()),
+                },
+                ScriptArtifactSpec {
+                    artifact_name: "ArtifactB".to_string(),
+                    create_prompt: "build B".to_string(),
+                    dependencies: vec!["ArtifactA".to_string()],
+                    target_branch: Some("feature/custom-b".to_string()),
+                },
+            ],
+            engine: Engine::Codex,
+            variants: 1,
+            sprints: 1,
+            keep_best: 1,
+        };
+
+        let script = generate_script(&spec);
+        assert!(script.contains("create ArtifactA from juliet"));
+        assert!(script.contains("create ArtifactB from juliet"));
+        assert!(script.contains("using [ArtifactA]"));
+        assert!(script.contains("// morgan.target-branch = feature/custom-a;"));
+        assert!(script.contains("// morgan.target-branch = feature/custom-b;"));
     }
 
     #[test]
@@ -469,6 +595,7 @@ with {
         assert_eq!(plan.keep_best, 2);
         assert_eq!(plan.create_prompt, "Ship it");
         assert!(plan.dependencies.is_empty());
+        assert_eq!(plan.target_branch, None);
     }
 
     #[test]
@@ -674,9 +801,81 @@ with {
     }
 
     #[test]
+    fn parse_execution_plan_extracts_target_branch_from_morgan_comment() {
+        let script = r#"
+juliet {
+  engine = codex;
+}
+
+cadence Fast {
+  variants = 2;
+}
+
+create ArtifactA from juliet "build A"
+with {
+  cadence = Fast;
+  // morgan.target-branch = feature/custom-a;
+};
+"#;
+
+        let plan = parse_execution_plan(script).expect("plan should parse");
+        assert_eq!(plan.target_branch.as_deref(), Some("feature/custom-a"));
+    }
+
+    #[test]
+    fn parse_execution_plan_extracts_target_branch_from_assignment() {
+        let script = r#"
+juliet {
+  engine = codex;
+}
+
+cadence Fast {
+  variants = 2;
+}
+
+create ArtifactA from juliet "build A"
+with {
+  cadence = Fast;
+  target_branch = "feature/custom-a";
+};
+"#;
+
+        let plan = parse_execution_plan(script).expect("plan should parse");
+        assert_eq!(plan.target_branch.as_deref(), Some("feature/custom-a"));
+    }
+
+    #[test]
+    fn parse_execution_plan_rejects_invalid_target_branch() {
+        let script = r#"
+juliet {
+  engine = codex;
+}
+
+cadence Fast {
+  variants = 2;
+}
+
+create ArtifactA from juliet "build A"
+with {
+  cadence = Fast;
+  // morgan.target-branch = feature/invalid branch;
+};
+"#;
+
+        let err = parse_execution_plan(script).expect_err("invalid target branch should fail");
+        assert!(err.to_string().contains("target branch"));
+    }
+
+    #[test]
     fn validate_artifact_name_rejects_invalid_identifiers() {
         assert!(validate_artifact_name("Artifact_1").is_ok());
         let err = validate_artifact_name("My Artifact").expect_err("name with spaces should fail");
         assert!(err.to_string().contains("invalid artifact name"));
+    }
+
+    #[test]
+    fn validate_target_branch_rejects_whitespace() {
+        let err = validate_target_branch("feature/has space").expect_err("whitespace should fail");
+        assert!(err.to_string().contains("whitespace"));
     }
 }

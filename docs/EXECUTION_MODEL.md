@@ -18,6 +18,9 @@ Per artifact plan:
 
 - artifact name
 - `using [...]` dependencies
+- optional target branch override from `with { ... }` via:
+  - `target_branch = "<branch>";`, or
+  - `// morgan.target-branch = <branch>;`
 - cadence values (`engine`, `variants`, `sprints`, `keep best`)
 - create prompt body
 
@@ -66,7 +69,9 @@ Initial source branch:
 
 For each artifact in order:
 
-1. target branch is derived as `feature/<artifact-slug>` (with numeric suffix on collision)
+1. target branch is resolved by:
+   - explicit artifact override when provided, otherwise
+   - derived `feature/<artifact-slug>` (with numeric suffix on collision)
 2. artifact runs with that `(source, target)` pair
 3. next artifact source branch becomes previous artifact target branch
 

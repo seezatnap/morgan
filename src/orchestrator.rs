@@ -13,8 +13,8 @@ use crate::engine::Engine;
 use crate::git;
 use crate::juliet::{JulietClient, JulietRunner};
 use crate::julietscript::{
-    ExecutionPlan, ScriptSpec, generate_script, lint_script, parse_execution_plans,
-    validate_artifact_name,
+    ExecutionPlan, ScriptArtifactSpec, ScriptSpec, build_create_prompt, generate_script,
+    lint_script, parse_execution_plans, validate_artifact_name,
 };
 use crate::preflight::{PreflightOptions, load_input_context, run_preflight};
 use crate::process_manager::{current_log_path, current_manager_id};
@@ -186,10 +186,14 @@ pub fn run_generated(options: RunGeneratedOptions) -> Result<RunSummary> {
 
     let input_context =
         load_input_context(&project_root, &options.input_files, options.max_input_bytes)?;
+    let create_prompt = build_create_prompt(&options.master_prompt, &input_context);
     let script = generate_script(&ScriptSpec {
-        artifact_name: options.artifact_name.clone(),
-        master_prompt: options.master_prompt.clone(),
-        input_context,
+        artifacts: vec![ScriptArtifactSpec {
+            artifact_name: options.artifact_name.clone(),
+            create_prompt,
+            dependencies: Vec::new(),
+            target_branch: None,
+        }],
         engine: options.engine,
         variants: options.variants,
         sprints: options.sprints,
@@ -591,12 +595,7 @@ fn run_with_plans(options: RunWithPlansOptions) -> Result<RunSummary> {
         );
     }
 
-    let mut used_targets = BTreeSet::new();
-    let target_branches = options
-        .plans
-        .iter()
-        .map(|plan| derive_target_branch(&plan.artifact_name, &mut used_targets))
-        .collect::<Vec<_>>();
+    let target_branches = resolve_target_branches(&options.plans)?;
 
     let mut source_branch = tracker.state.current_source_branch.clone();
     let mut shared_resume_id = tracker.state.shared_resume_id.clone();
@@ -1164,6 +1163,33 @@ fn validate_dependency_order(plans: &[ExecutionPlan]) -> Result<()> {
     Ok(())
 }
 
+fn resolve_target_branches(plans: &[ExecutionPlan]) -> Result<Vec<String>> {
+    let mut used_targets = BTreeSet::new();
+    let mut resolved = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let target_branch = if let Some(configured) = plan.target_branch.as_ref() {
+            let branch = configured.trim();
+            if branch.is_empty() {
+                bail!(
+                    "artifact '{}' has an empty target branch override",
+                    plan.artifact_name
+                );
+            }
+            if !used_targets.insert(branch.to_string()) {
+                bail!(
+                    "duplicate target branch '{}' is configured across multiple artifacts",
+                    branch
+                );
+            }
+            branch.to_string()
+        } else {
+            derive_target_branch(&plan.artifact_name, &mut used_targets)
+        };
+        resolved.push(target_branch);
+    }
+    Ok(resolved)
+}
+
 fn derive_target_branch(artifact_name: &str, used_targets: &mut BTreeSet<String>) -> String {
     let base = format!("feature/{}", slugify(artifact_name));
     if used_targets.insert(base.clone()) {
@@ -1261,6 +1287,7 @@ mod tests {
             keep_best: 1,
             create_prompt: "x".to_string(),
             dependencies: deps.iter().map(|dep| dep.to_string()).collect(),
+            target_branch: None,
         }
     }
 
@@ -1334,5 +1361,24 @@ mod tests {
         let second = derive_target_branch("Feature One", &mut used);
         assert_eq!(first, "feature/feature-one");
         assert_eq!(second, "feature/feature-one-2");
+    }
+
+    #[test]
+    fn resolves_target_branches_with_explicit_overrides() {
+        let mut plans = vec![plan("ArtifactA", &[]), plan("ArtifactB", &["ArtifactA"])];
+        plans[0].target_branch = Some("feature/custom-a".to_string());
+
+        let branches = resolve_target_branches(&plans).expect("target branches should resolve");
+        assert_eq!(branches, vec!["feature/custom-a", "feature/artifactb"]);
+    }
+
+    #[test]
+    fn rejects_duplicate_explicit_target_branches() {
+        let mut plans = vec![plan("ArtifactA", &[]), plan("ArtifactB", &["ArtifactA"])];
+        plans[0].target_branch = Some("feature/custom".to_string());
+        plans[1].target_branch = Some("feature/custom".to_string());
+
+        let err = resolve_target_branches(&plans).expect_err("duplicate branch should fail");
+        assert!(err.to_string().contains("duplicate target branch"));
     }
 }

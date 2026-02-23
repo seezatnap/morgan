@@ -4,7 +4,7 @@ Morgan is a Rust CLI/library for orchestrating Juliet workflows from JulietScrip
 
 It supports:
 
-1. Generating JulietScript from a master prompt and input files.
+1. Generating JulietScript from a master prompt plus input files or a multi-artifact plan file.
 2. Linting JulietScript (`julietscript-lint` on `PATH` first, manifest fallback second).
 3. Executing JulietScript against Juliet in non-interactive heartbeat loops.
 4. Running ordered multi-artifact plans from one script (`create A`, then `create B using [A]`, etc.).
@@ -97,6 +97,19 @@ cargo run -- run \
   --email you@example.com
 ```
 
+### Generate + Execute (Multi-Artifact Plan File)
+
+```bash
+cargo run -- run \
+  --project-root ../juliet \
+  --role director-of-engineering \
+  --project-name orchestrator \
+  --master-prompt "Build and validate the orchestration CLI." \
+  --artifact-plan-file examples/artifact-plan.json \
+  --source-branch main \
+  --email you@example.com
+```
+
 Inspect active workers:
 
 ```bash
@@ -163,7 +176,9 @@ Execution semantics:
 2. Each artifact is executed serially.
 3. Branch chain is propagated automatically:
    - initial source branch from `--source-branch` (or current branch)
-   - artifact target branch defaults to `feature/<artifact-slug>`
+   - artifact target branch defaults to `feature/<artifact-slug>`, but can be overridden per artifact with:
+     - `target_branch = "<branch>";` in `with { ... }`, or
+     - `// morgan.target-branch = <branch>;` comment in `with { ... }`
    - next artifact source branch becomes previous artifact target branch
 4. Every Juliet turn includes explicit branch context:
    - source branch

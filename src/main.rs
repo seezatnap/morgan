@@ -8,11 +8,12 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, ArgGroup, Parser};
 use morgan::engine::Engine;
 use morgan::julietscript::{
-    ScriptSpec, generate_script, lint_script, parse_execution_plan, validate_artifact_name,
+    ScriptArtifactSpec, ScriptSpec, build_create_prompt, generate_script, lint_script,
+    parse_execution_plans, validate_artifact_name, validate_target_branch,
 };
 use morgan::orchestrator::{
-    ExecuteScriptOptions, ReplayRunOptions, ReplaySummary, ResumeRunOptions, RunGeneratedOptions,
-    replay_run, resume_run, run_generated, run_script,
+    ExecuteScriptOptions, ReplayRunOptions, ReplaySummary, ResumeRunOptions, replay_run,
+    resume_run, run_script,
 };
 use morgan::preflight::load_input_context;
 use morgan::process_manager::{
@@ -23,6 +24,7 @@ use morgan::process_manager::{
     write_record,
 };
 use morgan::run_memory::now_unix_ms;
+use serde::Deserialize;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -97,8 +99,15 @@ struct GenerateArgs {
     #[arg(long, default_value = ".morgan/generated.julietscript")]
     script_output: PathBuf,
     /// Artifact identifier used in `create <Artifact> from juliet ...` within the script.
-    #[arg(long, default_value = "GeneratedArtifact")]
-    artifact_name: String,
+    ///
+    /// Ignored when `--artifact-plan-file` is supplied.
+    #[arg(long)]
+    artifact_name: Option<String>,
+    /// JSON file describing multiple artifacts for script generation.
+    ///
+    /// When set, this overrides `--artifact-name` and enables multi-artifact generation.
+    #[arg(long = "artifact-plan-file")]
+    artifact_plan_file: Option<PathBuf>,
     /// Engine value injected into `juliet { engine = ... }` and cadence defaults.
     #[arg(long, value_enum, default_value_t = Engine::Codex)]
     engine: Engine,
@@ -146,8 +155,15 @@ struct RunArgs {
     #[arg(long, default_value = "morgan-project")]
     project_name: String,
     /// Artifact identifier used in generated JulietScript `create` statement.
-    #[arg(long, default_value = "GeneratedArtifact")]
-    artifact_name: String,
+    ///
+    /// Ignored when `--artifact-plan-file` is supplied.
+    #[arg(long)]
+    artifact_name: Option<String>,
+    /// JSON file describing multiple artifacts for script generation.
+    ///
+    /// When set, this overrides `--artifact-name` and enables multi-artifact generation.
+    #[arg(long = "artifact-plan-file")]
+    artifact_plan_file: Option<PathBuf>,
     /// Inline master prompt text.
     ///
     /// Exactly one of `--master-prompt` or `--prompt-file` is required.
@@ -301,6 +317,28 @@ struct ReplayArgs {
     run_id: String,
 }
 
+const DEFAULT_ARTIFACT_NAME: &str = "GeneratedArtifact";
+
+#[derive(Debug, Deserialize)]
+struct ArtifactPlanFile {
+    artifacts: Vec<ArtifactPlanEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactPlanEntry {
+    name: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    input_files: Vec<PathBuf>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    using: Vec<String>,
+    #[serde(default)]
+    target_branch: Option<String>,
+}
+
 fn main() {
     let result = run();
     let exit_code = if result.is_ok() { 0 } else { 1 };
@@ -437,14 +475,17 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", args.project_root.display()))?;
 
-    validate_artifact_name(&args.artifact_name)?;
-
     let prompt = resolve_prompt(args.master_prompt, args.prompt_file, &project_root)?;
-    let input_context = load_input_context(&project_root, &args.input_files, args.max_input_bytes)?;
+    let artifacts = resolve_script_artifacts(
+        &project_root,
+        &prompt,
+        &args.input_files,
+        args.artifact_name.as_deref(),
+        args.artifact_plan_file.as_deref(),
+        args.max_input_bytes,
+    )?;
     let script = generate_script(&ScriptSpec {
-        artifact_name: args.artifact_name,
-        master_prompt: prompt,
-        input_context,
+        artifacts,
         engine: args.engine,
         variants: args.variants,
         sprints: args.sprints,
@@ -459,33 +500,53 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         lint_script(&script_path, &manifest)?;
     }
 
-    let plan = parse_execution_plan(&script)?;
+    let plans = parse_execution_plans(&script)?;
     println!(
-        "Generated script at {}\nEngine: {}\nVariants: {}\nSprints: {}\nKeep best: {}",
+        "Generated script at {}\nEngine: {}\nVariants: {}\nSprints: {}\nKeep best: {}\nArtifacts: {}",
         script_path.display(),
-        plan.engine,
-        plan.variants,
-        plan.sprints,
-        plan.keep_best
+        args.engine,
+        args.variants.max(1),
+        args.sprints.max(1),
+        args.keep_best.max(1),
+        plans.len()
     );
     Ok(())
 }
 
 fn run_full_run(args: RunArgs) -> Result<()> {
-    let prompt = resolve_prompt(args.master_prompt, args.prompt_file, &args.project_root)?;
+    let project_root = args
+        .project_root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", args.project_root.display()))?;
+    let prompt = resolve_prompt(args.master_prompt, args.prompt_file, &project_root)?;
+    let artifacts = resolve_script_artifacts(
+        &project_root,
+        &prompt,
+        &args.input_files,
+        args.artifact_name.as_deref(),
+        args.artifact_plan_file.as_deref(),
+        args.max_input_bytes,
+    )?;
 
-    let summary = run_generated(RunGeneratedOptions {
-        project_root: args.project_root,
-        role_name: args.role,
-        project_name: args.project_name,
-        artifact_name: args.artifact_name,
-        master_prompt: prompt,
-        input_files: args.input_files,
-        script_output: args.script_output,
+    let script = generate_script(&ScriptSpec {
+        artifacts,
         engine: args.engine,
         variants: args.variants,
         sprints: args.sprints,
         keep_best: args.keep_best,
+    });
+    let script_path = resolve_against(&project_root, &args.script_output);
+    write_file(&script_path, &script)?;
+    if !args.skip_lint {
+        let manifest = resolve_against(&project_root, &args.julietscript_manifest);
+        lint_script(&script_path, &manifest)?;
+    }
+
+    let summary = run_script(ExecuteScriptOptions {
+        project_root,
+        role_name: args.role,
+        project_name: args.project_name,
+        script_path: args.script_output,
         source_branch: args.source_branch,
         juliet_bin: args.juliet_bin,
         juliet_manifest: Some(args.juliet_manifest),
@@ -496,7 +557,6 @@ fn run_full_run(args: RunArgs) -> Result<()> {
         auto_fix_branches: args.auto_fix_branches,
         auto_grade: args.auto_grade,
         lint_enabled: !args.skip_lint,
-        max_input_bytes: args.max_input_bytes,
     })?;
 
     let _ = mark_current_process_run_id(&summary.run_id);
@@ -563,6 +623,100 @@ fn resolve_prompt(
     }
 }
 
+fn resolve_script_artifacts(
+    project_root: &Path,
+    master_prompt: &str,
+    default_input_files: &[PathBuf],
+    artifact_name: Option<&str>,
+    artifact_plan_file: Option<&Path>,
+    max_input_bytes: usize,
+) -> Result<Vec<ScriptArtifactSpec>> {
+    let Some(plan_path) = artifact_plan_file else {
+        let name = artifact_name.unwrap_or(DEFAULT_ARTIFACT_NAME);
+        validate_artifact_name(name)?;
+        let input_context = load_input_context(project_root, default_input_files, max_input_bytes)?;
+        return Ok(vec![ScriptArtifactSpec {
+            artifact_name: name.to_string(),
+            create_prompt: build_create_prompt(master_prompt, &input_context),
+            dependencies: Vec::new(),
+            target_branch: None,
+        }]);
+    };
+
+    let resolved_plan = resolve_against(project_root, plan_path);
+    let raw = fs::read_to_string(&resolved_plan).with_context(|| {
+        format!(
+            "failed to read artifact plan file {}",
+            resolved_plan.display()
+        )
+    })?;
+    let plan: ArtifactPlanFile = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "failed to parse artifact plan JSON {}",
+            resolved_plan.display()
+        )
+    })?;
+    if plan.artifacts.is_empty() {
+        bail!(
+            "artifact plan file {} does not include any artifacts",
+            resolved_plan.display()
+        );
+    }
+
+    let mut artifacts = Vec::with_capacity(plan.artifacts.len());
+    for entry in plan.artifacts {
+        validate_artifact_name(&entry.name)?;
+
+        let dependencies = merge_dependencies(&entry.dependencies, &entry.using);
+        for dependency in &dependencies {
+            validate_artifact_name(dependency)?;
+        }
+
+        let input_files = if entry.input_files.is_empty() {
+            default_input_files.to_vec()
+        } else {
+            entry.input_files
+        };
+        let input_context = load_input_context(project_root, &input_files, max_input_bytes)?;
+        let create_prompt = build_create_prompt(
+            entry.prompt.as_deref().unwrap_or(master_prompt),
+            &input_context,
+        );
+
+        let target_branch = entry
+            .target_branch
+            .as_ref()
+            .map(|branch| branch.trim().to_string());
+        if let Some(branch) = target_branch.as_deref() {
+            validate_target_branch(branch)?;
+        }
+
+        artifacts.push(ScriptArtifactSpec {
+            artifact_name: entry.name,
+            create_prompt,
+            dependencies,
+            target_branch,
+        });
+    }
+
+    Ok(artifacts)
+}
+
+fn merge_dependencies(primary: &[String], secondary: &[String]) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for dep in primary.iter().chain(secondary.iter()) {
+        let trimmed = dep.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            merged.push(trimmed.to_string());
+        }
+    }
+    merged
+}
+
 fn print_summary(summary: &morgan::orchestrator::RunSummary) {
     println!("Run ID: {}", summary.run_id);
     println!("Script: {}", summary.script_path.display());
@@ -627,4 +781,84 @@ fn write_file(path: &Path, contents: &str) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_script_artifacts_defaults_to_single_generated_artifact() {
+        let temp = tempdir().expect("tempdir");
+        fs::write(temp.path().join("spec.md"), "alpha").expect("write input");
+
+        let artifacts = resolve_script_artifacts(
+            temp.path(),
+            "master prompt",
+            &[PathBuf::from("spec.md")],
+            None,
+            None,
+            12_000,
+        )
+        .expect("artifacts should resolve");
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_name, DEFAULT_ARTIFACT_NAME);
+        assert_eq!(artifacts[0].target_branch, None);
+        assert!(artifacts[0].dependencies.is_empty());
+        assert!(artifacts[0].create_prompt.contains("master prompt"));
+    }
+
+    #[test]
+    fn resolve_script_artifacts_loads_multi_artifact_plan_file() {
+        let temp = tempdir().expect("tempdir");
+        fs::write(temp.path().join("phase1.md"), "phase1").expect("write phase1");
+        fs::write(temp.path().join("phase2.md"), "phase2").expect("write phase2");
+        fs::write(
+            temp.path().join("plan.json"),
+            r#"{
+  "artifacts": [
+    {
+      "name": "Phase1",
+      "prompt": "Build phase one",
+      "input_files": ["phase1.md"],
+      "target_branch": "feature/phase-1"
+    },
+    {
+      "name": "Phase2",
+      "input_files": ["phase2.md"],
+      "using": ["Phase1"],
+      "target_branch": "feature/phase-2"
+    }
+  ]
+}"#,
+        )
+        .expect("write plan");
+
+        let artifacts = resolve_script_artifacts(
+            temp.path(),
+            "global prompt",
+            &[],
+            Some("ignored"),
+            Some(Path::new("plan.json")),
+            12_000,
+        )
+        .expect("artifacts should resolve");
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].artifact_name, "Phase1");
+        assert_eq!(
+            artifacts[0].target_branch.as_deref(),
+            Some("feature/phase-1")
+        );
+        assert!(artifacts[0].create_prompt.contains("Build phase one"));
+        assert_eq!(artifacts[1].artifact_name, "Phase2");
+        assert_eq!(artifacts[1].dependencies, vec!["Phase1".to_string()]);
+        assert_eq!(
+            artifacts[1].target_branch.as_deref(),
+            Some("feature/phase-2")
+        );
+        assert!(artifacts[1].create_prompt.contains("global prompt"));
+    }
 }

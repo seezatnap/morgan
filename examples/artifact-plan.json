@@ -1,0 +1,18 @@
+{
+  "artifacts": [
+    {
+      "name": "ArtifactA",
+      "prompt": "Build ArtifactA first on top of the source branch.",
+      "input_files": ["prds/phase-1.md"],
+      "dependencies": [],
+      "target_branch": "feature/artifact-a"
+    },
+    {
+      "name": "ArtifactB",
+      "prompt": "Build ArtifactB after ArtifactA and incorporate outputs from ArtifactA.",
+      "input_files": ["prds/phase-2.md"],
+      "using": ["ArtifactA"],
+      "target_branch": "feature/artifact-b"
+    }
+  ]
+}
