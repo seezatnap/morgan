@@ -17,6 +17,7 @@ use crate::julietscript::{
     validate_artifact_name,
 };
 use crate::preflight::{PreflightOptions, load_input_context, run_preflight};
+use crate::process_manager::{current_log_path, current_manager_id};
 use crate::run_memory::{
     ActiveArtifactState, RunExecutionConfig, RunState, RunStatus, RunStore, load_run_state,
 };
@@ -403,7 +404,18 @@ impl RunTracker {
     }
 
     fn from_resume(project_root: &Path, state: RunState) -> Result<Self> {
+        let mut state = state;
+        if let Some(manager_id) = current_manager_id() {
+            state.manager_id = Some(manager_id);
+        }
+        if let Some(log_path) = current_log_path() {
+            state.log_path = Some(log_path);
+        }
+        state.morgan_pid = Some(std::process::id());
+        state.touch();
+
         let store = RunStore::open(project_root, &state.run_id)?;
+        store.save_state(&state)?;
         store.append_event(
             "run_resumed",
             &serde_json::json!({

@@ -4,12 +4,34 @@ Use:
 
 ```bash
 cargo run -- --help
+cargo run --bin morgan-manager -- --help
 cargo run -- generate --help
 cargo run -- run --help
 cargo run -- execute --help
 cargo run -- resume --help
 cargo run -- replay --help
 ```
+
+## Background Worker Model
+
+`run`, `execute`, and `resume` always spawn a background worker process.
+
+Foreground output contains:
+
+- manager id (`mgr-...`)
+- worker pid
+- command
+- logfile path
+
+Worker output is written to:
+
+- `.morgan/logs/<manager-id>.log`
+
+Manager records are written to:
+
+- `.morgan/manager/processes/<manager-id>.json`
+
+Use `morgan-manager` for lifecycle operations.
 
 ## `generate`
 
@@ -41,7 +63,7 @@ Key options:
 
 Purpose:
 
-- generate script, lint, and execute orchestration against Juliet.
+- generate script, lint, and execute orchestration against Juliet in a detached worker.
 
 Required:
 
@@ -67,7 +89,7 @@ Key options:
 
 Purpose:
 
-- execute an existing JulietScript file with ordered multi-artifact orchestration.
+- execute an existing JulietScript file with ordered multi-artifact orchestration in a detached worker.
 
 Required:
 
@@ -93,7 +115,7 @@ Key options:
 
 Purpose:
 
-- resume an interrupted/partial run from persisted checkpoint state.
+- resume an interrupted/partial run from persisted checkpoint state in a detached worker.
 
 Required:
 
@@ -116,6 +138,28 @@ Required:
 Key options:
 
 - `--project-root <dir>` base containing `.morgan/runs`.
+
+## `morgan-manager`
+
+Purpose:
+
+- inspect and control detached `morgan` worker processes.
+
+Use:
+
+```bash
+cargo run --bin morgan-manager -- --project-root <dir> status
+cargo run --bin morgan-manager -- --project-root <dir> kill --id <manager-id|run-id>
+cargo run --bin morgan-manager -- --project-root <dir> logs --id <manager-id|run-id>
+cargo run --bin morgan-manager -- --project-root <dir> cleanup
+```
+
+Subcommands:
+
+- `status` (default): prints a table of running workers (`--all` includes dead/stale records).
+- `kill --id`: sends `TERM`, then `KILL` after a grace timeout (`--grace-seconds`, default `5`).
+- `logs --id`: prints the logfile path for the target worker.
+- `cleanup`: removes stale record files (and optionally stale logs with `--remove-logs`).
 
 ## Runtime Requirements
 

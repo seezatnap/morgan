@@ -1,5 +1,8 @@
-use std::fs;
+use std::env;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, ArgGroup, Parser};
@@ -12,6 +15,14 @@ use morgan::orchestrator::{
     replay_run, resume_run, run_generated, run_script,
 };
 use morgan::preflight::load_input_context;
+use morgan::process_manager::{
+    ENV_FOREGROUND_WORKER, ENV_MANAGER_ID, ENV_MANAGER_LOG_PATH, ENV_MANAGER_RECORD_PATH,
+    ManagedProcessRecord, ManagedProcessStatus, ensure_manager_dirs, generate_manager_id,
+    is_foreground_worker, load_record, logs_dir, mark_current_process_exited,
+    mark_current_process_run_id, mark_current_process_running, record_path as manager_record_path,
+    write_record,
+};
+use morgan::run_memory::now_unix_ms;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +45,7 @@ enum Cli {
     Generate(GenerateArgs),
     /// Generate JulietScript, run preflight checks, and execute the workflow against Juliet.
     ///
+    /// This command starts a detached background worker and returns manager/log metadata.
     /// Use this when you want end-to-end orchestration (script generation + execution loop).
     #[command(
         name = "run",
@@ -45,9 +57,13 @@ enum Cli {
     )]
     Run(RunArgs),
     /// Execute an existing JulietScript file against Juliet without regenerating it.
+    ///
+    /// This command starts a detached background worker and returns manager/log metadata.
     #[command(name = "execute")]
     Execute(ExecuteArgs),
     /// Resume an interrupted run from persisted checkpoint state under `.morgan/runs/<run-id>`.
+    ///
+    /// This command starts a detached background worker and returns manager/log metadata.
     #[command(name = "resume")]
     Resume(ResumeArgs),
     /// Replay saved Juliet outputs through the classifier and report decision drift.
@@ -286,20 +302,133 @@ struct ReplayArgs {
 }
 
 fn main() {
-    if let Err(err) = run() {
+    let result = run();
+    let exit_code = if result.is_ok() { 0 } else { 1 };
+    let _ = mark_current_process_exited(exit_code);
+
+    if let Err(err) = result {
         eprintln!("morgan: {err:#}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
-    match Cli::parse() {
+    let cli = Cli::parse();
+    if should_run_in_background(&cli) && !is_foreground_worker() {
+        return spawn_background_worker(&cli);
+    }
+    if is_foreground_worker() {
+        let _ = mark_current_process_running();
+    }
+
+    match cli {
         Cli::Generate(args) => run_generate(args),
         Cli::Run(args) => run_full_run(args),
         Cli::Execute(args) => run_execute(args),
         Cli::Resume(args) => run_resume(args),
         Cli::Replay(args) => run_replay(args),
     }
+}
+
+fn should_run_in_background(cli: &Cli) -> bool {
+    matches!(cli, Cli::Run(_) | Cli::Execute(_) | Cli::Resume(_))
+}
+
+fn managed_command_name(cli: &Cli) -> &'static str {
+    match cli {
+        Cli::Run(_) => "run",
+        Cli::Execute(_) => "execute",
+        Cli::Resume(_) => "resume",
+        Cli::Generate(_) => "generate",
+        Cli::Replay(_) => "replay",
+    }
+}
+
+fn managed_project_root(cli: &Cli) -> PathBuf {
+    match cli {
+        Cli::Run(args) => args.project_root.clone(),
+        Cli::Execute(args) => args.project_root.clone(),
+        Cli::Resume(args) => args.project_root.clone(),
+        Cli::Generate(args) => args.project_root.clone(),
+        Cli::Replay(args) => args.project_root.clone(),
+    }
+}
+
+fn spawn_background_worker(cli: &Cli) -> Result<()> {
+    let raw_project_root = managed_project_root(cli);
+    let project_root = raw_project_root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", raw_project_root.display()))?;
+    ensure_manager_dirs(&project_root)?;
+
+    let manager_id = generate_manager_id();
+    let log_path = logs_dir(&project_root).join(format!("{manager_id}.log"));
+    let record_path = manager_record_path(&project_root, &manager_id);
+    let command = managed_command_name(cli).to_string();
+    let now = now_unix_ms();
+
+    let record = ManagedProcessRecord {
+        id: manager_id.clone(),
+        pid: 0,
+        command,
+        project_root: project_root.clone(),
+        log_path: log_path.clone(),
+        run_id: None,
+        status: ManagedProcessStatus::Launching,
+        exit_code: None,
+        started_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+    write_record(&record_path, &record)?;
+
+    let stdout_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let stderr_log = stdout_log
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+    let exe = env::current_exe().context("failed to resolve current executable path")?;
+    let args = env::args_os().skip(1).collect::<Vec<OsString>>();
+    let mut child = Command::new(exe);
+    child
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
+        .env(ENV_FOREGROUND_WORKER, "1")
+        .env(ENV_MANAGER_ID, &manager_id)
+        .env(ENV_MANAGER_LOG_PATH, &log_path)
+        .env(ENV_MANAGER_RECORD_PATH, &record_path);
+
+    let child = child
+        .spawn()
+        .context("failed to spawn background morgan worker")?;
+    let child_pid = child.id();
+    let mut merged_record = load_record(&record_path).unwrap_or(record.clone());
+    merged_record.pid = child_pid;
+    if matches!(
+        merged_record.status,
+        ManagedProcessStatus::Launching | ManagedProcessStatus::Running
+    ) {
+        merged_record.status = ManagedProcessStatus::Running;
+    }
+    merged_record.updated_at_unix_ms = now_unix_ms();
+    write_record(&record_path, &merged_record)?;
+
+    println!("Morgan started in background.");
+    println!("Manager ID: {}", merged_record.id);
+    println!("PID: {}", merged_record.pid);
+    println!("Command: {}", merged_record.command);
+    println!("Project root: {}", merged_record.project_root.display());
+    println!("Log: {}", merged_record.log_path.display());
+    println!(
+        "Use `morgan-manager --project-root {} status` to monitor.",
+        project_root.display()
+    );
+    Ok(())
 }
 
 fn run_generate(args: GenerateArgs) -> Result<()> {
@@ -370,6 +499,7 @@ fn run_full_run(args: RunArgs) -> Result<()> {
         max_input_bytes: args.max_input_bytes,
     })?;
 
+    let _ = mark_current_process_run_id(&summary.run_id);
     print_summary(&summary);
     Ok(())
 }
@@ -392,6 +522,7 @@ fn run_execute(args: ExecuteArgs) -> Result<()> {
         lint_enabled: !args.skip_lint,
     })?;
 
+    let _ = mark_current_process_run_id(&summary.run_id);
     print_summary(&summary);
     Ok(())
 }
@@ -401,6 +532,7 @@ fn run_resume(args: ResumeArgs) -> Result<()> {
         project_root: args.project_root,
         run_id: args.run_id,
     })?;
+    let _ = mark_current_process_run_id(&summary.run_id);
     print_summary(&summary);
     Ok(())
 }

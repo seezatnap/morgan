@@ -2,6 +2,14 @@
 
 This document describes the current `run` / `execute` orchestration flow, including persisted run memory used by `resume` and `replay`.
 
+## 0. Process Model
+
+- `run`, `execute`, and `resume` are launched as detached background workers.
+- Foreground CLI invocation prints manager metadata (manager id, pid, logfile path) and exits.
+- Worker logs are written to `.morgan/logs/<manager-id>.log`.
+- Worker registry records are stored in `.morgan/manager/processes/<manager-id>.json`.
+- `morgan-manager` provides status/kill/logs/cleanup operations over those worker records.
+
 ## 1. Script Plan Discovery
 
 Morgan parses the JulietScript and builds an ordered list of artifact plans from `create` statements.
@@ -118,6 +126,8 @@ Morgan returns:
   - source/target branches
   - per-artifact PRD path
   - completion status
+
+For detached worker runs, this summary is written to the worker logfile.
 
 ## 9. Run Memory (Event-Sourced Checkpoints)
 

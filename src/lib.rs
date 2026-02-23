@@ -5,4 +5,5 @@ pub mod juliet;
 pub mod julietscript;
 pub mod orchestrator;
 pub mod preflight;
+pub mod process_manager;
 pub mod run_memory;

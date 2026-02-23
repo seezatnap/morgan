@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::julietscript::ExecutionPlan;
 use crate::orchestrator::{ArtifactRunSummary, TurnRecord};
+use crate::process_manager::{current_log_path, current_manager_id};
 
 const STATE_FILE: &str = "state.json";
 const EVENTS_FILE: &str = "events.jsonl";
@@ -63,6 +64,12 @@ pub struct RunState {
     pub status_message: Option<String>,
     pub started_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    #[serde(default)]
+    pub manager_id: Option<String>,
+    #[serde(default)]
+    pub morgan_pid: Option<u32>,
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
     pub artifact_runs: Vec<ArtifactRunSummary>,
     pub turns: Vec<TurnRecord>,
     pub active_artifact: Option<ActiveArtifactState>,
@@ -80,6 +87,8 @@ impl RunState {
         initial_source_branch: String,
     ) -> Self {
         let now = now_unix_ms();
+        let manager_id = current_manager_id();
+        let log_path = current_log_path();
         Self {
             version: STATE_VERSION,
             run_id: generate_run_id(),
@@ -96,6 +105,9 @@ impl RunState {
             status_message: None,
             started_at_unix_ms: now,
             updated_at_unix_ms: now,
+            manager_id,
+            morgan_pid: Some(process::id()),
+            log_path,
             artifact_runs: Vec::new(),
             turns: Vec::new(),
             active_artifact: None,

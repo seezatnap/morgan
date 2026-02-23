@@ -36,13 +36,37 @@ cargo build
 
 ```bash
 cargo run -- --help
+cargo run --bin morgan-manager -- --help
 ```
 
 - `generate`: create a JulietScript file only.
-- `run`: generate script + execute orchestrated workflow.
-- `execute`: execute an existing JulietScript file.
-- `resume`: continue an interrupted run from `.morgan/runs/<run-id>/state.json`.
+- `run`: generate script + execute orchestrated workflow in a background worker.
+- `execute`: execute an existing JulietScript file in a background worker.
+- `resume`: continue an interrupted run from `.morgan/runs/<run-id>/state.json` in a background worker.
 - `replay`: reclassify saved Juliet outputs and report signal drift.
+- `morgan-manager`:
+  - `status` table of running workers (default command)
+  - `kill --id <manager-id|run-id>` to stop a worker
+  - `logs --id <manager-id|run-id>` to print its logfile path
+  - `cleanup` to remove stale manager records
+
+## Background Execution
+
+`run`, `execute`, and `resume` always spawn a detached worker process.
+
+The foreground command prints:
+
+- manager id (`mgr-...`)
+- worker pid
+- logfile path
+
+Logfiles are written under:
+
+- `.morgan/logs/<manager-id>.log`
+
+Manager records are written under:
+
+- `.morgan/manager/processes/<manager-id>.json`
 
 ## Quick Start
 
@@ -71,6 +95,18 @@ cargo run -- run \
   --sprints 2 \
   --source-branch main \
   --email you@example.com
+```
+
+Inspect active workers:
+
+```bash
+cargo run --bin morgan-manager -- --project-root ../juliet status
+```
+
+Stop a worker:
+
+```bash
+cargo run --bin morgan-manager -- --project-root ../juliet kill --id mgr-1739971812345-12345
 ```
 
 ### Execute Existing Script
@@ -188,7 +224,7 @@ Defaults:
 
 ## Output Summary
 
-`run` and `execute` print:
+`run`, `execute`, and `resume` write summary output into their worker logfile:
 
 - run id
 - script path
