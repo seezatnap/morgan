@@ -203,7 +203,7 @@ struct RunArgs {
     #[arg(long)]
     email: Option<String>,
     /// Seconds between automated heartbeat status turns while work is in progress.
-    #[arg(long = "heartbeat-seconds", default_value_t = 20)]
+    #[arg(long = "heartbeat-seconds", default_value_t = 300)]
     heartbeat_seconds: u64,
     /// Maximum number of non-interactive turns before the run exits.
     #[arg(long = "max-turns", default_value_t = 60)]
@@ -264,7 +264,7 @@ struct ExecuteArgs {
     #[arg(long)]
     email: Option<String>,
     /// Seconds between automated heartbeat status turns while work is in progress.
-    #[arg(long = "heartbeat-seconds", default_value_t = 20)]
+    #[arg(long = "heartbeat-seconds", default_value_t = 300)]
     heartbeat_seconds: u64,
     /// Maximum number of non-interactive turns before the run exits.
     #[arg(long = "max-turns", default_value_t = 60)]
