@@ -14,7 +14,7 @@ use crate::git;
 use crate::juliet::{JulietClient, JulietRunner};
 use crate::julietscript::{
     ExecutionPlan, ScriptArtifactSpec, ScriptSpec, build_create_prompt, generate_script,
-    lint_script, parse_execution_plans, validate_artifact_name,
+    lint_script, parse_execution_plans, validate_artifact_name, validate_target_branch,
 };
 use crate::preflight::{PreflightOptions, load_input_context, run_preflight};
 use crate::process_manager::{current_log_path, current_manager_id};
@@ -168,6 +168,12 @@ struct DecisionTrace {
     classifier_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TargetBranchSidecar {
+    #[serde(default)]
+    target_branches: std::collections::BTreeMap<String, String>,
+}
+
 pub fn run_generated(options: RunGeneratedOptions) -> Result<RunSummary> {
     let project_root = options
         .project_root
@@ -191,6 +197,11 @@ pub fn run_generated(options: RunGeneratedOptions) -> Result<RunSummary> {
         artifacts: vec![ScriptArtifactSpec {
             artifact_name: options.artifact_name.clone(),
             create_prompt,
+            source_files: options
+                .input_files
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect(),
             dependencies: Vec::new(),
             target_branch: None,
         }],
@@ -251,7 +262,8 @@ pub fn run_script(options: ExecuteScriptOptions) -> Result<RunSummary> {
         lint_script(&script_path, &manifest)?;
     }
 
-    let plans = parse_execution_plans(&script_contents)?;
+    let mut plans = parse_execution_plans(&script_contents)?;
+    apply_target_branch_sidecar(&script_path, &mut plans)?;
 
     run_with_plans(RunWithPlansOptions {
         project_root,
@@ -1230,10 +1242,20 @@ fn write_master_prd(
     } else {
         plan.dependencies.join(", ")
     };
+    let source_files = if plan.source_files.is_empty() {
+        "(none)".to_string()
+    } else {
+        plan.source_files
+            .iter()
+            .map(|path| format!("- {}", path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let contents = format!(
-        "# {project_name} - {}\n\n## Master Prompt\n\n{}\n\n## Branch Context\n\n- source branch: {}\n- target branch: {}\n- dependencies: {}\n\n## Generated JulietScript\n\n- {}\n",
+        "# {project_name} - {}\n\n## Master Prompt\n\n{}\n\n## Artifact Source Files\n\n{}\n\n## Branch Context\n\n- source branch: {}\n- target branch: {}\n- dependencies: {}\n\n## Generated JulietScript\n\n- {}\n",
         plan.artifact_name,
         plan.create_prompt,
+        source_files,
         source_branch,
         target_branch,
         dependencies,
@@ -1243,6 +1265,34 @@ fn write_master_prd(
     fs::write(&prd_path, contents)
         .with_context(|| format!("failed to write {}", prd_path.display()))?;
     Ok(prd_path)
+}
+
+fn target_branch_sidecar_path(script_path: &Path) -> Result<PathBuf> {
+    let file_name = script_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("script path is not valid UTF-8")?;
+    Ok(script_path.with_file_name(format!("{file_name}.morgan-target-branches.json")))
+}
+
+fn apply_target_branch_sidecar(script_path: &Path, plans: &mut [ExecutionPlan]) -> Result<()> {
+    let sidecar_path = target_branch_sidecar_path(script_path)?;
+    if !sidecar_path.is_file() {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&sidecar_path)
+        .with_context(|| format!("failed to read {}", sidecar_path.display()))?;
+    let payload: TargetBranchSidecar = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", sidecar_path.display()))?;
+
+    for plan in plans {
+        if let Some(branch) = payload.target_branches.get(&plan.artifact_name) {
+            validate_target_branch(branch)?;
+            plan.target_branch = Some(branch.trim().to_string());
+        }
+    }
+    Ok(())
 }
 
 fn resolve_lint_manifest(project_root: &Path, manifest: Option<&PathBuf>) -> PathBuf {
@@ -1277,6 +1327,9 @@ fn slugify(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    use tempfile::tempdir;
 
     fn plan(name: &str, deps: &[&str]) -> ExecutionPlan {
         ExecutionPlan {
@@ -1286,6 +1339,7 @@ mod tests {
             sprints: 1,
             keep_best: 1,
             create_prompt: "x".to_string(),
+            source_files: Vec::new(),
             dependencies: deps.iter().map(|dep| dep.to_string()).collect(),
             target_branch: None,
         }
@@ -1380,5 +1434,30 @@ mod tests {
 
         let err = resolve_target_branches(&plans).expect_err("duplicate branch should fail");
         assert!(err.to_string().contains("duplicate target branch"));
+    }
+
+    #[test]
+    fn applies_target_branch_sidecar_overrides() {
+        let temp = tempdir().expect("tempdir");
+        let script_path = temp.path().join("generated.julietscript");
+        fs::write(
+            &script_path,
+            "create ArtifactA from juliet \"x\" with { cadence = X; };",
+        )
+        .expect("write script");
+        let sidecar_path = target_branch_sidecar_path(&script_path).expect("sidecar path");
+        fs::write(
+            &sidecar_path,
+            r#"{
+  "target_branches": {
+    "ArtifactA": "feature/custom-a"
+  }
+}"#,
+        )
+        .expect("write sidecar");
+
+        let mut plans = vec![plan("ArtifactA", &[])];
+        apply_target_branch_sidecar(&script_path, &mut plans).expect("apply sidecar");
+        assert_eq!(plans[0].target_branch.as_deref(), Some("feature/custom-a"));
     }
 }

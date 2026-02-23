@@ -108,6 +108,12 @@ Artifact plan JSON format (`--artifact-plan-file`):
 }
 ```
 
+Generation behavior:
+
+- `generate` and `run` emit `create <Artifact> from julietArtifactSourceFiles [ ... ]`.
+- Morgan writes per-artifact instruction files under `.morgan/source-files/` and includes those paths in each source file list.
+- When artifact plans include per-artifact `target_branch`, Morgan writes sidecar metadata at `<script>.morgan-target-branches.json`; `execute` automatically applies those overrides.
+
 ## `execute`
 
 Purpose:

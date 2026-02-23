@@ -275,6 +275,7 @@ mod tests {
             sprints: 1,
             keep_best: 1,
             create_prompt: "Ship it".to_string(),
+            source_files: Vec::new(),
             dependencies: Vec::new(),
             target_branch: None,
         }

@@ -23,6 +23,8 @@ pub struct ScriptArtifactSpec {
     pub artifact_name: String,
     pub create_prompt: String,
     #[serde(default)]
+    pub source_files: Vec<String>,
+    #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub target_branch: Option<String>,
@@ -36,6 +38,8 @@ pub struct ExecutionPlan {
     pub sprints: u32,
     pub keep_best: u32,
     pub create_prompt: String,
+    #[serde(default)]
+    pub source_files: Vec<String>,
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub target_branch: Option<String>,
@@ -142,11 +146,24 @@ pub fn validate_target_branch(target_branch: &str) -> Result<()> {
 }
 
 fn render_create_statement(artifact: &ScriptArtifactSpec) -> String {
-    let mut statement = format!(
-        "create {} from juliet \"\"\"\n{}\n\"\"\"\n",
-        artifact.artifact_name,
-        escape_block_string(&artifact.create_prompt)
-    );
+    let mut statement = if artifact.source_files.is_empty() {
+        format!(
+            "create {} from juliet \"\"\"\n{}\n\"\"\"\n",
+            artifact.artifact_name,
+            escape_block_string(&artifact.create_prompt)
+        )
+    } else {
+        let sources = artifact
+            .source_files
+            .iter()
+            .map(|path| format!("  {}", encode_string_literal(path)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!(
+            "create {} from julietArtifactSourceFiles [\n{}\n]\n",
+            artifact.artifact_name, sources
+        )
+    };
     if !artifact.dependencies.is_empty() {
         statement.push_str(&format!("using [{}]\n", artifact.dependencies.join(", ")));
     }
@@ -155,12 +172,6 @@ fn render_create_statement(artifact: &ScriptArtifactSpec) -> String {
     statement.push_str("  failureTriage = FailureTriage;\n");
     statement.push_str("  cadence = DeliveryCadence;\n");
     statement.push_str("  rubric = DeliveryRubric;\n");
-    if let Some(target_branch) = &artifact.target_branch {
-        statement.push_str(&format!(
-            "  // morgan.target-branch = {};\n",
-            target_branch.trim()
-        ));
-    }
     statement.push_str("};");
     statement
 }
@@ -178,7 +189,7 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
         Regex::new(r#"(?ms)^\s*cadence\s+(?P<name>[A-Za-z][A-Za-z0-9_]*)\s*\{(?P<body>.*?)\}"#)
             .unwrap();
     let create_re = Regex::new(
-        r#"(?ms)^\s*create\s+(?P<artifact>[A-Za-z][A-Za-z0-9_]*)\s+from\s+juliet\s+(?P<prompt>"""[\s\S]*?"""|"(?:\\.|[^"])*")(?:\s+using\s*\[(?P<using>[^\]]*)\])?\s+with\s*\{(?P<with_body>.*?)\}\s*;"#,
+        r#"(?ms)^\s*create\s+(?P<artifact>[A-Za-z][A-Za-z0-9_]*)\s+from\s+(?:(?:juliet\s+(?P<prompt>"""[\s\S]*?"""|"(?:\\.|[^"])*"))|(?:julietArtifactSourceFiles\s*\[(?P<source_files>[^\]]*?)\]))(?:\s+using\s*\[(?P<using>[^\]]*)\])?\s+with\s*\{(?P<with_body>.*?)\}\s*;"#,
     )
     .unwrap();
     let juliet_block_re = Regex::new(r#"(?ms)^\s*juliet\s*\{(?P<body>.*?)\}"#).unwrap();
@@ -238,19 +249,51 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
             .map(|m| m.as_str().to_string())
             .context("missing artifact name in create statement")?;
 
-        let create_prompt_raw = create_caps
-            .name("prompt")
-            .map(|m| m.as_str())
-            .context("missing create prompt in create statement")?;
-
-        let create_prompt = decode_string_literal(create_prompt_raw).with_context(|| {
-            format!("failed to parse create prompt literal: {create_prompt_raw}")
-        })?;
+        let (create_prompt, source_files) = if let Some(create_prompt_raw) =
+            create_caps.name("prompt").map(|m| m.as_str())
+        {
+            let create_prompt = decode_string_literal(create_prompt_raw).with_context(|| {
+                format!("failed to parse create prompt literal: {create_prompt_raw}")
+            })?;
+            (create_prompt, Vec::new())
+        } else if let Some(source_files_raw) = create_caps.name("source_files").map(|m| m.as_str())
+        {
+            let source_files = parse_source_files(source_files_raw).with_context(|| {
+                format!(
+                    "failed to parse source files list for create '{}'",
+                    artifact_name
+                )
+            })?;
+            if source_files.is_empty() {
+                bail!(
+                    "create '{}' from julietArtifactSourceFiles must include at least one source file",
+                    artifact_name
+                );
+            }
+            let create_prompt = format!(
+                "Artifact source files:\n{}",
+                source_files
+                    .iter()
+                    .map(|file| format!("- {}", file))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            (create_prompt, source_files)
+        } else {
+            bail!(
+                "create '{}' must use either `from juliet \"...\"` or `from julietArtifactSourceFiles [...]`",
+                artifact_name
+            );
+        };
 
         let with_body = create_caps
             .name("with_body")
             .map(|m| m.as_str())
             .context("missing with block in create statement")?;
+        let create_statement = create_caps
+            .get(0)
+            .map(|m| m.as_str())
+            .context("missing create statement body")?;
         let cadence_name = cadence_ref_re
             .captures(with_body)
             .and_then(|caps| caps.name("name").map(|m| m.as_str().to_string()));
@@ -278,6 +321,7 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
         let dependencies = parse_dependencies(create_caps.name("using").map(|m| m.as_str()));
         let target_branch = parse_target_branch(
             with_body,
+            create_statement,
             &target_branch_assignment_re,
             &target_branch_comment_re,
         )?;
@@ -289,6 +333,7 @@ pub fn parse_execution_plans(script: &str) -> Result<Vec<ExecutionPlan>> {
             sprints: cadence.sprints,
             keep_best: cadence.keep_best,
             create_prompt,
+            source_files,
             dependencies,
             target_branch,
         });
@@ -403,6 +448,10 @@ fn decode_string_literal(literal: &str) -> Result<String> {
     bail!("unsupported string literal format");
 }
 
+fn encode_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("\"{}\"", value))
+}
+
 fn capture_engine(block_body: &str) -> Option<Engine> {
     let re = Regex::new(r#"\bengine\s*=\s*(?P<engine>"[^"]+"|[A-Za-z]+)\s*;"#).unwrap();
     for line in block_body.lines() {
@@ -483,8 +532,23 @@ fn parse_dependencies(using_block: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn parse_source_files(source_files_block: &str) -> Result<Vec<String>> {
+    let source_file_literal_re = Regex::new(r#""(?:\\.|[^"])*""#).unwrap();
+    let mut files = Vec::new();
+    for literal in source_file_literal_re.find_iter(source_files_block) {
+        let decoded = decode_string_literal(literal.as_str())?;
+        let trimmed = decoded.trim();
+        if trimmed.is_empty() {
+            bail!("source files list cannot include empty paths");
+        }
+        files.push(trimmed.to_string());
+    }
+    Ok(files)
+}
+
 fn parse_target_branch(
     with_body: &str,
+    create_statement: &str,
     assignment_re: &Regex,
     comment_re: &Regex,
 ) -> Result<Option<String>> {
@@ -493,7 +557,7 @@ fn parse_target_branch(
         .and_then(|caps| caps.name("branch").map(|m| m.as_str().to_string()))
         .or_else(|| {
             comment_re
-                .captures(with_body)
+                .captures(create_statement)
                 .and_then(|caps| caps.name("branch").map(|m| m.as_str().to_string()))
         });
     let Some(raw) = raw else {
@@ -519,6 +583,7 @@ mod tests {
             artifacts: vec![ScriptArtifactSpec {
                 artifact_name: "ShipCLI".to_string(),
                 create_prompt: build_create_prompt("Build the release CLI.", "- /tmp/spec.md"),
+                source_files: vec!["/tmp/spec.md".to_string()],
                 dependencies: Vec::new(),
                 target_branch: None,
             }],
@@ -533,7 +598,7 @@ mod tests {
         assert!(script.contains("policy Preflight"));
         assert!(script.contains("rubric DeliveryRubric"));
         assert!(script.contains("cadence DeliveryCadence"));
-        assert!(script.contains("create ShipCLI from juliet"));
+        assert!(script.contains("create ShipCLI from julietArtifactSourceFiles"));
     }
 
     #[test]
@@ -543,12 +608,14 @@ mod tests {
                 ScriptArtifactSpec {
                     artifact_name: "ArtifactA".to_string(),
                     create_prompt: "build A".to_string(),
+                    source_files: vec!["prds/a.md".to_string()],
                     dependencies: Vec::new(),
                     target_branch: Some("feature/custom-a".to_string()),
                 },
                 ScriptArtifactSpec {
                     artifact_name: "ArtifactB".to_string(),
                     create_prompt: "build B".to_string(),
+                    source_files: vec!["prds/b.md".to_string()],
                     dependencies: vec!["ArtifactA".to_string()],
                     target_branch: Some("feature/custom-b".to_string()),
                 },
@@ -560,11 +627,12 @@ mod tests {
         };
 
         let script = generate_script(&spec);
-        assert!(script.contains("create ArtifactA from juliet"));
-        assert!(script.contains("create ArtifactB from juliet"));
+        assert!(script.contains("create ArtifactA from julietArtifactSourceFiles"));
+        assert!(script.contains("create ArtifactB from julietArtifactSourceFiles"));
+        assert!(script.contains("\"prds/a.md\""));
+        assert!(script.contains("\"prds/b.md\""));
         assert!(script.contains("using [ArtifactA]"));
-        assert!(script.contains("// morgan.target-branch = feature/custom-a;"));
-        assert!(script.contains("// morgan.target-branch = feature/custom-b;"));
+        assert!(!script.contains("morgan.target-branch"));
     }
 
     #[test]
@@ -594,6 +662,7 @@ with {
         assert_eq!(plan.sprints, 3);
         assert_eq!(plan.keep_best, 2);
         assert_eq!(plan.create_prompt, "Ship it");
+        assert!(plan.source_files.is_empty());
         assert!(plan.dependencies.is_empty());
         assert_eq!(plan.target_branch, None);
     }
@@ -625,7 +694,38 @@ with {
         let plan = parse_execution_plan(script).expect("plan should parse block strings");
         assert!(plan.create_prompt.contains("line one"));
         assert!(plan.create_prompt.contains("line two"));
+        assert!(plan.source_files.is_empty());
         assert!(plan.dependencies.is_empty());
+    }
+
+    #[test]
+    fn parse_execution_plan_supports_juliet_artifact_source_files() {
+        let script = r#"
+juliet {
+  engine = codex;
+}
+
+cadence X {
+  variants = 2;
+  sprints = 1;
+}
+
+create ArtifactA from julietArtifactSourceFiles [
+  "prds/phase-1.md",
+  "docs/notes.md"
+]
+with {
+  cadence = X;
+};
+"#;
+
+        let plan = parse_execution_plan(script).expect("source file plan should parse");
+        assert_eq!(plan.artifact_name, "ArtifactA");
+        assert_eq!(
+            plan.source_files,
+            vec!["prds/phase-1.md".to_string(), "docs/notes.md".to_string()]
+        );
+        assert!(plan.create_prompt.contains("Artifact source files:"));
     }
 
     #[test]

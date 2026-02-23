@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -8,14 +9,13 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, ArgGroup, Parser};
 use morgan::engine::Engine;
 use morgan::julietscript::{
-    ScriptArtifactSpec, ScriptSpec, build_create_prompt, generate_script, lint_script,
-    parse_execution_plans, validate_artifact_name, validate_target_branch,
+    ScriptArtifactSpec, ScriptSpec, generate_script, lint_script, parse_execution_plans,
+    validate_artifact_name, validate_target_branch,
 };
 use morgan::orchestrator::{
     ExecuteScriptOptions, ReplayRunOptions, ReplaySummary, ResumeRunOptions, replay_run,
     resume_run, run_script,
 };
-use morgan::preflight::load_input_context;
 use morgan::process_manager::{
     ENV_FOREGROUND_WORKER, ENV_MANAGER_ID, ENV_MANAGER_LOG_PATH, ENV_MANAGER_RECORD_PATH,
     ManagedProcessRecord, ManagedProcessStatus, ensure_manager_dirs, generate_manager_id,
@@ -24,7 +24,7 @@ use morgan::process_manager::{
     write_record,
 };
 use morgan::run_memory::now_unix_ms;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -339,6 +339,12 @@ struct ArtifactPlanEntry {
     target_branch: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TargetBranchSidecar {
+    #[serde(default)]
+    target_branches: BTreeMap<String, String>,
+}
+
 fn main() {
     let result = run();
     let exit_code = if result.is_ok() { 0 } else { 1 };
@@ -484,6 +490,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         args.artifact_plan_file.as_deref(),
         args.max_input_bytes,
     )?;
+    let target_branches = collect_target_branches(&artifacts);
     let script = generate_script(&ScriptSpec {
         artifacts,
         engine: args.engine,
@@ -494,6 +501,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
 
     let script_path = resolve_against(&project_root, &args.script_output);
     write_file(&script_path, &script)?;
+    write_target_branch_sidecar(&script_path, &target_branches)?;
 
     if !args.skip_lint {
         let manifest = resolve_against(&project_root, &args.julietscript_manifest);
@@ -527,6 +535,7 @@ fn run_full_run(args: RunArgs) -> Result<()> {
         args.artifact_plan_file.as_deref(),
         args.max_input_bytes,
     )?;
+    let target_branches = collect_target_branches(&artifacts);
 
     let script = generate_script(&ScriptSpec {
         artifacts,
@@ -537,6 +546,7 @@ fn run_full_run(args: RunArgs) -> Result<()> {
     });
     let script_path = resolve_against(&project_root, &args.script_output);
     write_file(&script_path, &script)?;
+    write_target_branch_sidecar(&script_path, &target_branches)?;
     if !args.skip_lint {
         let manifest = resolve_against(&project_root, &args.julietscript_manifest);
         lint_script(&script_path, &manifest)?;
@@ -631,13 +641,23 @@ fn resolve_script_artifacts(
     artifact_plan_file: Option<&Path>,
     max_input_bytes: usize,
 ) -> Result<Vec<ScriptArtifactSpec>> {
+    let _ = max_input_bytes;
     let Some(plan_path) = artifact_plan_file else {
         let name = artifact_name.unwrap_or(DEFAULT_ARTIFACT_NAME);
         validate_artifact_name(name)?;
-        let input_context = load_input_context(project_root, default_input_files, max_input_bytes)?;
+        ensure_input_files_exist(project_root, default_input_files)?;
+        let source_files = prepare_artifact_source_files(
+            project_root,
+            name,
+            master_prompt,
+            None,
+            default_input_files,
+            0,
+        )?;
         return Ok(vec![ScriptArtifactSpec {
             artifact_name: name.to_string(),
-            create_prompt: build_create_prompt(master_prompt, &input_context),
+            create_prompt: format_source_files_prompt(&source_files),
+            source_files,
             dependencies: Vec::new(),
             target_branch: None,
         }]);
@@ -677,11 +697,16 @@ fn resolve_script_artifacts(
         } else {
             entry.input_files
         };
-        let input_context = load_input_context(project_root, &input_files, max_input_bytes)?;
-        let create_prompt = build_create_prompt(
-            entry.prompt.as_deref().unwrap_or(master_prompt),
-            &input_context,
-        );
+        ensure_input_files_exist(project_root, &input_files)?;
+        let source_files = prepare_artifact_source_files(
+            project_root,
+            &entry.name,
+            master_prompt,
+            entry.prompt.as_deref(),
+            &input_files,
+            artifacts.len(),
+        )?;
+        let create_prompt = format_source_files_prompt(&source_files);
 
         let target_branch = entry
             .target_branch
@@ -694,6 +719,7 @@ fn resolve_script_artifacts(
         artifacts.push(ScriptArtifactSpec {
             artifact_name: entry.name,
             create_prompt,
+            source_files,
             dependencies,
             target_branch,
         });
@@ -715,6 +741,135 @@ fn merge_dependencies(primary: &[String], secondary: &[String]) -> Vec<String> {
         }
     }
     merged
+}
+
+fn collect_target_branches(artifacts: &[ScriptArtifactSpec]) -> BTreeMap<String, String> {
+    artifacts
+        .iter()
+        .filter_map(|artifact| {
+            artifact
+                .target_branch
+                .as_ref()
+                .map(|branch| (artifact.artifact_name.clone(), branch.trim().to_string()))
+        })
+        .collect()
+}
+
+fn target_branch_sidecar_path(script_path: &Path) -> Result<PathBuf> {
+    let file_name = script_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("script path is not valid UTF-8")?;
+    Ok(script_path.with_file_name(format!("{file_name}.morgan-target-branches.json")))
+}
+
+fn write_target_branch_sidecar(
+    script_path: &Path,
+    target_branches: &BTreeMap<String, String>,
+) -> Result<()> {
+    let sidecar_path = target_branch_sidecar_path(script_path)?;
+    if target_branches.is_empty() {
+        if sidecar_path.exists() {
+            fs::remove_file(&sidecar_path)
+                .with_context(|| format!("failed to remove {}", sidecar_path.display()))?;
+        }
+        return Ok(());
+    }
+
+    let payload = TargetBranchSidecar {
+        target_branches: target_branches.clone(),
+    };
+    let encoded =
+        serde_json::to_string_pretty(&payload).context("failed to serialize target sidecar")?;
+    write_file(&sidecar_path, &encoded)
+}
+
+fn ensure_input_files_exist(project_root: &Path, input_files: &[PathBuf]) -> Result<()> {
+    for file in input_files {
+        let resolved = resolve_against(project_root, file);
+        if !resolved.exists() {
+            bail!("input file does not exist: {}", resolved.display());
+        }
+        if !resolved.is_file() {
+            bail!("input path is not a file: {}", resolved.display());
+        }
+        fs::File::open(&resolved)
+            .with_context(|| format!("input file is not readable: {}", resolved.display()))?;
+    }
+    Ok(())
+}
+
+fn prepare_artifact_source_files(
+    project_root: &Path,
+    artifact_name: &str,
+    master_prompt: &str,
+    artifact_prompt: Option<&str>,
+    input_files: &[PathBuf],
+    index: usize,
+) -> Result<Vec<String>> {
+    let slug = slugify(artifact_name);
+    let instruction_rel = format!(
+        ".morgan/source-files/{:02}-{}-instructions.md",
+        index + 1,
+        slug
+    );
+    let instruction_abs = resolve_against(project_root, Path::new(&instruction_rel));
+    let resolved_input_files = input_files
+        .iter()
+        .map(|path| resolve_against(project_root, path))
+        .collect::<Vec<_>>();
+    let source_listing = if input_files.is_empty() {
+        "(none)".to_string()
+    } else {
+        resolved_input_files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let instructions = format!(
+        "# Artifact Instructions: {artifact_name}\n\n## Master Prompt\n\n{master_prompt}\n\n## Artifact Prompt\n\n{artifact_prompt}\n\n## Source Files\n\n{source_listing}\n\n## Operational Requirements\n\n- Run preflight checks before sprint launches.\n- Ask for review when a human decision is required.\n- If branches drift or mismatch, stop and ask for branch clarification before continuing.\n- Grade sprint results using the rubric before selecting winners.\n",
+        artifact_name = artifact_name,
+        master_prompt = master_prompt.trim(),
+        artifact_prompt = artifact_prompt.unwrap_or(master_prompt).trim(),
+        source_listing = source_listing
+    );
+    write_file(&instruction_abs, &instructions)?;
+
+    let mut files = Vec::with_capacity(1 + input_files.len());
+    files.push(instruction_abs.to_string_lossy().to_string());
+    files.extend(
+        resolved_input_files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    Ok(files)
+}
+
+fn format_source_files_prompt(source_files: &[String]) -> String {
+    format!(
+        "Artifact source files:\n{}",
+        source_files
+            .iter()
+            .map(|file| format!("- {}", file))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn slugify(input: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+    output.trim_matches('-').to_string()
 }
 
 fn print_summary(summary: &morgan::orchestrator::RunSummary) {
@@ -806,8 +961,15 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].artifact_name, DEFAULT_ARTIFACT_NAME);
         assert_eq!(artifacts[0].target_branch, None);
+        assert!(!artifacts[0].source_files.is_empty());
+        assert!(artifacts[0].source_files[0].contains("/.morgan/source-files/"));
+        assert!(artifacts[0].source_files[1].ends_with("/spec.md"));
         assert!(artifacts[0].dependencies.is_empty());
-        assert!(artifacts[0].create_prompt.contains("master prompt"));
+        assert!(
+            artifacts[0]
+                .create_prompt
+                .contains("Artifact source files:")
+        );
     }
 
     #[test]
@@ -852,13 +1014,33 @@ mod tests {
             artifacts[0].target_branch.as_deref(),
             Some("feature/phase-1")
         );
-        assert!(artifacts[0].create_prompt.contains("Build phase one"));
+        assert!(
+            artifacts[0]
+                .create_prompt
+                .contains("Artifact source files:")
+        );
+        assert!(
+            artifacts[0]
+                .source_files
+                .iter()
+                .any(|file| file.ends_with("/phase1.md"))
+        );
         assert_eq!(artifacts[1].artifact_name, "Phase2");
         assert_eq!(artifacts[1].dependencies, vec!["Phase1".to_string()]);
         assert_eq!(
             artifacts[1].target_branch.as_deref(),
             Some("feature/phase-2")
         );
-        assert!(artifacts[1].create_prompt.contains("global prompt"));
+        assert!(
+            artifacts[1]
+                .create_prompt
+                .contains("Artifact source files:")
+        );
+        assert!(
+            artifacts[1]
+                .source_files
+                .iter()
+                .any(|file| file.ends_with("/phase2.md"))
+        );
     }
 }
