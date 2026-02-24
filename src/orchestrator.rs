@@ -1001,40 +1001,53 @@ fn run_single_artifact(
                     .and_then(|hint| hint.winning_branch.clone())
                     .or_else(|| extract_winning_branch_from_results(&response.text));
                 let work_remaining = guidance.and_then(|hint| hint.work_remaining);
-                if let Some(branch) = winning_branch.as_ref() {
-                    active_source_branch = branch.clone();
-                }
+                let canonical_branch = target_branch.to_string();
+                let merge_direction = if let Some(branch) = winning_branch.as_ref() {
+                    if branch == target_branch {
+                        format!(
+                            "winner branch {} already matches canonical branch {}.",
+                            branch, target_branch
+                        )
+                    } else {
+                        format!(
+                            "merge winner branch {} into canonical branch {} before starting the next sprint cycle.",
+                            branch, target_branch
+                        )
+                    }
+                } else {
+                    format!(
+                        "identify the winning branch explicitly and merge it into canonical branch {} before starting the next sprint cycle.",
+                        target_branch
+                    )
+                };
+                active_source_branch = canonical_branch.clone();
 
                 let next_cycle = sprint_cycle.saturating_add(1);
                 if auto_grade {
-                    if let Some(branch) = winning_branch.as_ref() {
-                        next_instruction = format!(
-                            "grade these results using your rubric, summarize winner branches, and continue to the next sprint if work remains. continue from source branch {} toward target branch {}. do not restart from original source branch {}. traceability: run {} next cycle {}.",
-                            branch, target_branch, source_branch, run_id, next_cycle
-                        );
-                    } else {
-                        next_instruction = format!(
-                            "grade these results using your rubric and identify the winning branch explicitly. if work remains, continue from that winning branch as source branch toward target branch {} (do not restart from {}). traceability: run {} next cycle {}.",
-                            target_branch, source_branch, run_id, next_cycle
-                        );
-                    }
+                    next_instruction = format!(
+                        "grade these results using your rubric and summarize winner branches. {} if work remains, continue with source branch {} and target branch {} for the next sprint cycle. do not restart from original source branch {}. traceability: run {} next cycle {}.",
+                        merge_direction,
+                        canonical_branch.as_str(),
+                        target_branch,
+                        source_branch,
+                        run_id,
+                        next_cycle
+                    );
                     if work_remaining == Some(false) {
                         next_instruction
                             .push_str(" if no work remains, mark results complete in your reply.");
                     }
                     decision_note = "requested_auto_grade_then_continue".to_string();
                 } else {
-                    if let Some(branch) = winning_branch.as_ref() {
-                        next_instruction = format!(
-                            "looks good. continue to the next sprint from source branch {} toward target branch {}. traceability: run {} next cycle {}.",
-                            branch, target_branch, run_id, next_cycle
-                        );
-                    } else {
-                        next_instruction = format!(
-                            "looks good. continue to the next sprint from the winning branch toward target branch {}. do not restart from {}. traceability: run {} next cycle {}.",
-                            target_branch, source_branch, run_id, next_cycle
-                        );
-                    }
+                    next_instruction = format!(
+                        "looks good. {} continue the next sprint cycle with source branch {} and target branch {}. do not restart from original source branch {}. traceability: run {} next cycle {}.",
+                        merge_direction,
+                        canonical_branch.as_str(),
+                        target_branch,
+                        source_branch,
+                        run_id,
+                        next_cycle
+                    );
                     decision_note = "approved_results_and_continue".to_string();
                 }
                 sprint_cycle = next_cycle;
