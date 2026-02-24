@@ -359,6 +359,11 @@ struct ReplayArgs {
     /// Run identifier printed in normal run/execute summaries.
     #[arg(long = "run-id")]
     run_id: String,
+    /// Follow the spawned worker logfile in this terminal.
+    ///
+    /// Press Ctrl-C to stop following; the worker keeps running in the background.
+    #[arg(long = "follow", default_value_t = false, action = ArgAction::SetTrue)]
+    follow: bool,
 }
 
 const DEFAULT_ARTIFACT_NAME: &str = "GeneratedArtifact";
@@ -421,6 +426,7 @@ fn run() -> Result<()> {
 
 fn should_run_in_background(cli: &Cli) -> bool {
     matches!(cli, Cli::Run(_) | Cli::Execute(_) | Cli::Resume(_))
+        || matches!(cli, Cli::Replay(args) if args.follow)
 }
 
 fn should_follow_logs(cli: &Cli) -> bool {
@@ -428,7 +434,8 @@ fn should_follow_logs(cli: &Cli) -> bool {
         Cli::Run(args) => args.follow,
         Cli::Execute(args) => args.follow,
         Cli::Resume(args) => args.follow,
-        Cli::Generate(_) | Cli::Replay(_) => false,
+        Cli::Replay(args) => args.follow,
+        Cli::Generate(_) => false,
     }
 }
 

@@ -17,6 +17,7 @@ cargo run -- replay --help
 `run`, `execute`, and `resume` always spawn a background worker process.
 
 Add `--follow` to stream the worker logfile in the current terminal. Press `Ctrl-C` to stop following; the worker continues running in the background.
+`replay` uses a worker only when `--follow` is enabled.
 
 Foreground output contains:
 
@@ -172,6 +173,7 @@ Required:
 Key options:
 
 - `--project-root <dir>` base containing `.morgan/runs`.
+- `--follow`
 
 ## `morgan-manager`
 
@@ -227,6 +229,7 @@ cargo run -- execute \
   --role director-of-engineering \
   --project-name orchestrator \
   --script-path examples/dependent-artifacts.julietscript \
+  --follow \
   --source-branch main \
   --email you@example.com
 ```
@@ -249,6 +252,7 @@ Resume:
 ```bash
 cargo run -- resume \
   --project-root ../juliet \
+  --follow \
   --run-id run-1739971812345-12345
 ```
 
@@ -257,5 +261,6 @@ Replay:
 ```bash
 cargo run -- replay \
   --project-root ../juliet \
+  --follow \
   --run-id run-1739971812345-12345
 ```

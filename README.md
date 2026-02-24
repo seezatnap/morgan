@@ -54,7 +54,7 @@ cargo run --bin morgan-manager -- --help
 
 `run`, `execute`, and `resume` always spawn a detached worker process.
 
-Use `--follow` on those commands to stream the worker log in your terminal. Press `Ctrl-C` to stop following; Morgan prints the manager ID and PID, and the worker continues in the background.
+Use `--follow` on those commands (and on `replay`) to stream the worker log in your terminal. Press `Ctrl-C` to stop following; Morgan prints the manager ID and PID, and the worker continues in the background.
 
 The foreground command prints:
 
@@ -164,6 +164,7 @@ cargo run -- resume \
 ```bash
 cargo run -- replay \
   --project-root ../juliet \
+  --follow \
   --run-id run-1739971812345-12345
 ```
 

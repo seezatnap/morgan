@@ -868,8 +868,8 @@ fn run_single_artifact(
             &format!(
                 "resume_id={} instruction=\"{}\" outbound=\"{}\"",
                 resume_id.as_deref().unwrap_or("<new>"),
-                lifecycle_preview(&next_instruction, 200),
-                lifecycle_preview(&outbound, 260),
+                lifecycle_preview(&next_instruction),
+                lifecycle_preview(&outbound),
             ),
         );
         let response = client.exec_turn(plan.engine, &outbound, resume_id.as_deref())?;
@@ -888,7 +888,7 @@ fn run_single_artifact(
                 decision.source,
                 decision.rule.as_deref().unwrap_or("-"),
                 decision.classifier_error.as_deref().unwrap_or("-"),
-                lifecycle_preview(&response.text, 260),
+                lifecycle_preview(&response.text),
             ),
         );
 
@@ -985,7 +985,7 @@ fn run_single_artifact(
                 "signal={:?} action={} next_instruction=\"{}\" completed={} final_grade_requested={} should_break={}",
                 signal,
                 decision_note,
-                lifecycle_preview(&next_instruction, 200),
+                lifecycle_preview(&next_instruction),
                 completed,
                 final_grade_requested,
                 should_break,
@@ -1034,15 +1034,9 @@ fn log_lifecycle_event(artifact_name: &str, turn: u32, stage: &str, detail: &str
     ));
 }
 
-fn lifecycle_preview(text: &str, max_chars: usize) -> String {
+fn lifecycle_preview(text: &str) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-
-    let mut truncated = compact.chars().take(max_chars).collect::<String>();
-    truncated.push_str("...");
-    truncated
+    compact
 }
 
 fn compose_turn_message(
