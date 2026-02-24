@@ -41,6 +41,8 @@ pub struct ActiveArtifactState {
     pub artifact_name: String,
     pub source_branch: String,
     pub target_branch: String,
+    #[serde(default = "default_sprint_cycle")]
+    pub sprint_cycle: u32,
     pub next_instruction: String,
     pub resume_id: Option<String>,
     pub final_grade_requested: bool,
@@ -256,6 +258,10 @@ fn generate_run_id() -> String {
 
 fn run_dir(project_root: &Path, run_id: &str) -> PathBuf {
     project_root.join(".morgan").join("runs").join(run_id)
+}
+
+fn default_sprint_cycle() -> u32 {
+    1
 }
 
 #[cfg(test)]

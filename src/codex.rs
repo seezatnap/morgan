@@ -24,6 +24,20 @@ struct ActionEnvelope {
     action: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultsGuidance {
+    pub winning_branch: Option<String>,
+    pub work_remaining: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResultsGuidanceEnvelope {
+    #[serde(default)]
+    winning_branch: Option<String>,
+    #[serde(default)]
+    work_remaining: Option<bool>,
+}
+
 pub fn ensure_codex_ready(cwd: &Path) -> Result<()> {
     let output = Command::new("codex")
         .arg("login")
@@ -75,9 +89,40 @@ pub fn classify_juliet_output(cwd: &Path, juliet_output: &str) -> Result<CodexAc
     parse_action_from_message(&agent_message)
 }
 
+pub fn infer_results_guidance(cwd: &Path, juliet_output: &str) -> Result<ResultsGuidance> {
+    let prompt = build_results_guidance_prompt(juliet_output);
+    let output = Command::new("codex")
+        .arg("exec")
+        .arg(prompt)
+        .arg("--json")
+        .arg("--skip-git-repo-check")
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to execute `codex exec` in {}", cwd.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "`codex exec` results guidance failed (exit {}):\n{}",
+            output.status.code().unwrap_or(1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let agent_message = extract_last_agent_message(&output.stdout)
+        .context("results guidance did not return an agent_message result")?;
+    parse_results_guidance_from_message(&agent_message)
+}
+
 fn build_classifier_prompt(juliet_output: &str) -> String {
     format!(
         "Classify the most appropriate next action from JULIET_OUTPUT only.\nReturn ONLY compact JSON with shape {{\"action\":\"<label>\"}}.\nAllowed labels: needs_email, needs_task_review, still_working, results_review, results_complete, branch_clarification, idle, unknown.\n\nJULIET_OUTPUT:\n{}",
+        juliet_output
+    )
+}
+
+fn build_results_guidance_prompt(juliet_output: &str) -> String {
+    format!(
+        "Extract result-routing hints from JULIET_OUTPUT only.\nReturn ONLY compact JSON with shape {{\"winning_branch\":<string|null>,\"work_remaining\":<true|false|null>}}.\nRules:\n- winning_branch: provide the winning git branch when explicit or strongly implied; otherwise null.\n- work_remaining: true when more sprint work remains, false when the work appears complete, null when unclear.\n- Do not include extra keys.\n\nJULIET_OUTPUT:\n{}",
         juliet_output
     )
 }
@@ -125,6 +170,44 @@ fn parse_action_from_message(message: &str) -> Result<CodexAction> {
         "unable to parse classifier action JSON from message: {}",
         message
     )
+}
+
+fn parse_results_guidance_from_message(message: &str) -> Result<ResultsGuidance> {
+    if let Ok(envelope) = serde_json::from_str::<ResultsGuidanceEnvelope>(message) {
+        return normalize_results_guidance(envelope);
+    }
+
+    let object_re = Regex::new(r#"\{[\s\S]*\}"#).unwrap();
+    if let Some(found) = object_re.find(message) {
+        let snippet = found.as_str();
+        if let Ok(envelope) = serde_json::from_str::<ResultsGuidanceEnvelope>(snippet) {
+            return normalize_results_guidance(envelope);
+        }
+    }
+
+    bail!(
+        "unable to parse results guidance JSON from message: {}",
+        message
+    )
+}
+
+fn normalize_results_guidance(envelope: ResultsGuidanceEnvelope) -> Result<ResultsGuidance> {
+    let branch_re = Regex::new(r#"^[A-Za-z0-9._/\-]+$"#).unwrap();
+    let winning_branch = envelope
+        .winning_branch
+        .map(|branch| branch.trim().trim_matches('`').to_string())
+        .filter(|branch| !branch.is_empty());
+
+    if let Some(branch) = winning_branch.as_deref()
+        && !branch_re.is_match(branch)
+    {
+        bail!("invalid winning_branch '{}' from guidance", branch);
+    }
+
+    Ok(ResultsGuidance {
+        winning_branch,
+        work_remaining: envelope.work_remaining,
+    })
 }
 
 fn map_action_label(label: &str) -> Result<CodexAction> {
@@ -209,6 +292,36 @@ mod tests {
         )
         .expect("should parse embedded json");
         assert_eq!(action, CodexAction::ResultsComplete);
+    }
+
+    #[test]
+    fn parses_results_guidance_json() {
+        let guidance = parse_results_guidance_from_message(
+            r#"{"winning_branch":"feature/foo-try2","work_remaining":true}"#,
+        )
+        .expect("should parse guidance");
+        assert_eq!(
+            guidance,
+            ResultsGuidance {
+                winning_branch: Some("feature/foo-try2".to_string()),
+                work_remaining: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_embedded_results_guidance_json() {
+        let guidance = parse_results_guidance_from_message(
+            "Winner summary:\n{\"winning_branch\":\"feature/foo\",\"work_remaining\":false}",
+        )
+        .expect("should parse embedded guidance");
+        assert_eq!(
+            guidance,
+            ResultsGuidance {
+                winning_branch: Some("feature/foo".to_string()),
+                work_remaining: Some(false),
+            }
+        );
     }
 
     #[test]

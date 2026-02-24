@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::codex::{CodexAction, classify_juliet_output, ensure_codex_ready};
+use crate::codex::{
+    CodexAction, classify_juliet_output, ensure_codex_ready, infer_results_guidance,
+};
 use crate::engine::Engine;
 use crate::git;
 use crate::juliet::{JulietClient, JulietRunner};
@@ -138,6 +140,8 @@ pub struct TurnRecord {
     pub classifier_error: Option<String>,
     pub source_branch: String,
     pub target_branch: String,
+    #[serde(default)]
+    pub sprint_cycle: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +382,8 @@ struct RunWithPlansOptions {
 
 #[derive(Debug, Clone)]
 struct ArtifactResumeState {
+    source_branch: String,
+    sprint_cycle: u32,
     next_instruction: String,
     resume_id: Option<String>,
     final_grade_requested: bool,
@@ -484,6 +490,7 @@ impl RunTracker {
         plan: &ExecutionPlan,
         source_branch: &str,
         target_branch: &str,
+        sprint_cycle: u32,
         next_instruction: String,
         resume_id: Option<String>,
         final_grade_requested: bool,
@@ -494,6 +501,7 @@ impl RunTracker {
             artifact_name: plan.artifact_name.clone(),
             source_branch: source_branch.to_string(),
             target_branch: target_branch.to_string(),
+            sprint_cycle,
             next_instruction,
             resume_id: resume_id.clone(),
             final_grade_requested,
@@ -518,6 +526,8 @@ impl RunTracker {
     fn record_turn(
         &mut self,
         turn: &TurnRecord,
+        source_branch: &str,
+        sprint_cycle: u32,
         next_instruction: &str,
         resume_id: Option<&str>,
         final_grade_requested: bool,
@@ -527,10 +537,13 @@ impl RunTracker {
             .active_artifact
             .as_mut()
             .context("internal error: missing active artifact while recording turn")?;
+        active.source_branch = source_branch.to_string();
+        active.sprint_cycle = sprint_cycle;
         active.next_instruction = next_instruction.to_string();
         active.resume_id = resume_id.map(ToOwned::to_owned);
         active.final_grade_requested = final_grade_requested;
         active.turns.push(turn.clone());
+        self.state.current_source_branch = source_branch.to_string();
         self.state.turns.push(turn.clone());
         if let Some(id) = resume_id {
             self.state.shared_resume_id = Some(id.to_string());
@@ -617,6 +630,7 @@ fn run_with_plans(options: RunWithPlansOptions) -> Result<RunSummary> {
     let start_index = tracker.state.next_artifact_index;
     let mut active_resume = tracker.state.active_artifact.clone();
     let mut last_execution_root: Option<PathBuf> = None;
+    let run_id = tracker.state.run_id.clone();
 
     if start_index > options.plans.len() {
         bail!(
@@ -642,17 +656,18 @@ fn run_with_plans(options: RunWithPlansOptions) -> Result<RunSummary> {
                     artifact_index
                 );
             }
-            if active.source_branch != source_branch || active.target_branch != target_branch {
+            if active.target_branch != target_branch {
                 bail!(
-                    "active artifact branch mismatch for '{}': expected {} -> {}, found {} -> {}",
+                    "active artifact branch mismatch for '{}': expected target {}, found {}",
                     plan.artifact_name,
-                    source_branch,
                     target_branch,
-                    active.source_branch,
                     active.target_branch
                 );
             }
+            source_branch = active.source_branch.clone();
             Some(ArtifactResumeState {
+                source_branch: active.source_branch,
+                sprint_cycle: active.sprint_cycle,
                 next_instruction: active.next_instruction,
                 resume_id: active.resume_id,
                 final_grade_requested: active.final_grade_requested,
@@ -684,6 +699,7 @@ fn run_with_plans(options: RunWithPlansOptions) -> Result<RunSummary> {
             &options.role_name,
             &options.project_name,
             &options.script_path,
+            &run_id,
             plan,
             artifact_index,
             &source_branch,
@@ -753,6 +769,7 @@ fn run_single_artifact(
     role_name: &str,
     project_name: &str,
     script_path: &Path,
+    run_id: &str,
     plan: &ExecutionPlan,
     artifact_index: usize,
     source_branch: &str,
@@ -769,14 +786,24 @@ fn run_single_artifact(
     let client = JulietClient::new(juliet_runner.clone(), execution_root, role_name);
     client.ensure_role_initialized()?;
 
+    let mut active_source_branch = source_branch.to_string();
+    let mut sprint_cycle = continuation
+        .as_ref()
+        .map(|state| state.sprint_cycle.max(1))
+        .unwrap_or(1);
+    if let Some(state) = continuation.as_ref() {
+        active_source_branch = state.source_branch.clone();
+    }
+
     let current_branch = git::current_branch(execution_root)?;
-    if source_branch != current_branch && !auto_fix_branches {
-        if let Some(other_worktree) = git::worktree_for_branch(execution_root, source_branch)?
+    if active_source_branch != current_branch && !auto_fix_branches {
+        if let Some(other_worktree) =
+            git::worktree_for_branch(execution_root, &active_source_branch)?
             && !paths_match(execution_root, &other_worktree)
         {
             bail!(
                 "source branch '{}' for artifact '{}' is checked out at worktree '{}'. Re-run from that worktree or enable --auto-fix-branches.",
-                source_branch,
+                active_source_branch,
                 plan.artifact_name,
                 other_worktree.display()
             );
@@ -784,16 +811,16 @@ fn run_single_artifact(
         bail!(
             "current branch '{}' does not match source branch '{}' for artifact '{}'. Enable --auto-fix-branches or align manually.",
             current_branch,
-            source_branch,
+            active_source_branch,
             plan.artifact_name
         );
     }
 
-    if source_branch != current_branch && auto_fix_branches {
-        if git::branch_exists(execution_root, source_branch)? {
-            git::checkout(execution_root, source_branch)?;
+    if active_source_branch != current_branch && auto_fix_branches {
+        if git::branch_exists(execution_root, &active_source_branch)? {
+            git::checkout(execution_root, &active_source_branch)?;
         } else {
-            git::create_branch(execution_root, source_branch, Some(&current_branch))?;
+            git::create_branch(execution_root, &active_source_branch, Some(&current_branch))?;
         }
     }
 
@@ -803,7 +830,7 @@ fn run_single_artifact(
         project_name,
         script_path,
         plan,
-        source_branch,
+        &active_source_branch,
         target_branch,
     )?;
 
@@ -811,7 +838,7 @@ fn run_single_artifact(
         "start artifact {} from prd path {}. use source branch {} and target branch {}. execution workspace: {}.",
         plan.artifact_name,
         prd_path.display(),
-        source_branch,
+        active_source_branch,
         target_branch,
         execution_root.display()
     );
@@ -845,8 +872,9 @@ fn run_single_artifact(
         run_tracker.begin_artifact(
             artifact_index,
             plan,
-            source_branch,
+            &active_source_branch,
             target_branch,
+            sprint_cycle,
             next_instruction.clone(),
             resume_id.clone(),
             final_grade_requested,
@@ -860,13 +888,24 @@ fn run_single_artifact(
         .map(|record| record.turn.saturating_add(1))
         .unwrap_or(1);
     for turn in starting_turn..=max_turns {
-        let outbound = compose_turn_message(&next_instruction, plan, source_branch, target_branch);
+        let turn_cycle = sprint_cycle;
+        let outbound = compose_turn_message(
+            &next_instruction,
+            run_id,
+            turn_cycle,
+            plan,
+            &active_source_branch,
+            target_branch,
+        );
         log_lifecycle_event(
             &plan.artifact_name,
             turn,
             "send",
             &format!(
-                "resume_id={} instruction=\"{}\" outbound=\"{}\"",
+                "run_id={} cycle={} source_branch={} resume_id={} instruction=\"{}\" outbound=\"{}\"",
+                run_id,
+                turn_cycle,
+                active_source_branch,
                 resume_id.as_deref().unwrap_or("<new>"),
                 lifecycle_preview(&next_instruction),
                 lifecycle_preview(&outbound),
@@ -902,8 +941,9 @@ fn run_single_artifact(
             decision_source: Some(decision.source),
             decision_rule: decision.rule.clone(),
             classifier_error: decision.classifier_error.clone(),
-            source_branch: source_branch.to_string(),
+            source_branch: active_source_branch.clone(),
             target_branch: target_branch.to_string(),
+            sprint_cycle: Some(turn_cycle),
         };
         turns.push(turn_record.clone());
 
@@ -922,8 +962,15 @@ fn run_single_artifact(
             }
             JulietSignal::NeedsTaskReview => {
                 next_instruction = format!(
-                    "tasks look good. use {}. run {} variations and {} sprints. use source branch {} and target branch {}.",
-                    plan.engine, plan.variants, plan.sprints, source_branch, target_branch
+                    "tasks look good. use {}. run {} variations and {} sprints. use source branch {} and target branch {}. traceability: run {} cycle {}. create fresh variation branch names that include suffix c{} and do not reuse prior try branches.",
+                    plan.engine,
+                    plan.variants,
+                    plan.sprints,
+                    active_source_branch,
+                    target_branch,
+                    run_id,
+                    sprint_cycle,
+                    sprint_cycle,
                 );
                 decision_note = "approved_tasks_and_requested_execution".to_string();
             }
@@ -948,13 +995,49 @@ fn run_single_artifact(
                 }
             }
             JulietSignal::ResultsReview => {
+                let guidance = infer_results_guidance(execution_root, &response.text).ok();
+                let winning_branch = guidance
+                    .as_ref()
+                    .and_then(|hint| hint.winning_branch.clone())
+                    .or_else(|| extract_winning_branch_from_results(&response.text));
+                let work_remaining = guidance.and_then(|hint| hint.work_remaining);
+                if let Some(branch) = winning_branch.as_ref() {
+                    active_source_branch = branch.clone();
+                }
+
+                let next_cycle = sprint_cycle.saturating_add(1);
                 if auto_grade {
-                    next_instruction = "grade these results using your rubric, summarize winner branches, and continue to the next sprint if work remains.".to_string();
+                    if let Some(branch) = winning_branch.as_ref() {
+                        next_instruction = format!(
+                            "grade these results using your rubric, summarize winner branches, and continue to the next sprint if work remains. continue from source branch {} toward target branch {}. do not restart from original source branch {}. traceability: run {} next cycle {}.",
+                            branch, target_branch, source_branch, run_id, next_cycle
+                        );
+                    } else {
+                        next_instruction = format!(
+                            "grade these results using your rubric and identify the winning branch explicitly. if work remains, continue from that winning branch as source branch toward target branch {} (do not restart from {}). traceability: run {} next cycle {}.",
+                            target_branch, source_branch, run_id, next_cycle
+                        );
+                    }
+                    if work_remaining == Some(false) {
+                        next_instruction
+                            .push_str(" if no work remains, mark results complete in your reply.");
+                    }
                     decision_note = "requested_auto_grade_then_continue".to_string();
                 } else {
-                    next_instruction = "looks good. continue to the next sprint.".to_string();
+                    if let Some(branch) = winning_branch.as_ref() {
+                        next_instruction = format!(
+                            "looks good. continue to the next sprint from source branch {} toward target branch {}. traceability: run {} next cycle {}.",
+                            branch, target_branch, run_id, next_cycle
+                        );
+                    } else {
+                        next_instruction = format!(
+                            "looks good. continue to the next sprint from the winning branch toward target branch {}. do not restart from {}. traceability: run {} next cycle {}.",
+                            target_branch, source_branch, run_id, next_cycle
+                        );
+                    }
                     decision_note = "approved_results_and_continue".to_string();
                 }
+                sprint_cycle = next_cycle;
             }
             JulietSignal::ResultsComplete => {
                 if auto_grade && !final_grade_requested {
@@ -970,7 +1053,7 @@ fn run_single_artifact(
             JulietSignal::BranchClarification => {
                 next_instruction = repair_branches_and_respond(
                     execution_root,
-                    source_branch,
+                    &active_source_branch,
                     target_branch,
                     auto_fix_branches,
                 )?;
@@ -982,7 +1065,9 @@ fn run_single_artifact(
             turn,
             "decision",
             &format!(
-                "signal={:?} action={} next_instruction=\"{}\" completed={} final_grade_requested={} should_break={}",
+                "cycle={} source_branch={} signal={:?} action={} next_instruction=\"{}\" completed={} final_grade_requested={} should_break={}",
+                sprint_cycle,
+                active_source_branch,
                 signal,
                 decision_note,
                 lifecycle_preview(&next_instruction),
@@ -995,6 +1080,8 @@ fn run_single_artifact(
         if let Some(run_tracker) = tracker.as_mut() {
             run_tracker.record_turn(
                 &turn_record,
+                &active_source_branch,
+                sprint_cycle,
                 &next_instruction,
                 resume_id.as_deref(),
                 final_grade_requested,
@@ -1041,6 +1128,8 @@ fn lifecycle_preview(text: &str) -> String {
 
 fn compose_turn_message(
     instruction: &str,
+    run_id: &str,
+    sprint_cycle: u32,
     plan: &ExecutionPlan,
     source_branch: &str,
     target_branch: &str,
@@ -1052,8 +1141,14 @@ fn compose_turn_message(
     };
 
     format!(
-        "{instruction}\n\nExecution context:\n- artifact: {}\n- source branch: {}\n- destination branch: {}\n- target branch: {}\n- dependencies: {}",
-        plan.artifact_name, source_branch, target_branch, target_branch, dependencies
+        "{instruction}\n\nExecution context:\n- artifact: {}\n- run id: {}\n- sprint cycle: {}\n- source branch: {}\n- destination branch: {}\n- target branch: {}\n- dependencies: {}",
+        plan.artifact_name,
+        run_id,
+        sprint_cycle,
+        source_branch,
+        target_branch,
+        target_branch,
+        dependencies
     )
 }
 
@@ -1088,7 +1183,7 @@ fn classify_response_hybrid_with_raw(
     text: &str,
     classifier_error: Option<String>,
 ) -> DecisionTrace {
-    if let Some((override_signal, rule)) = guardrail_override_signal(text)
+    if let Some((override_signal, rule)) = guardrail_override_signal(raw_signal, text)
         && override_signal != raw_signal
     {
         return DecisionTrace {
@@ -1127,7 +1222,10 @@ fn classify_response_with_codex(project_root: &Path, text: &str) -> Result<Julie
     })
 }
 
-fn guardrail_override_signal(text: &str) -> Option<(JulietSignal, &'static str)> {
+fn guardrail_override_signal(
+    raw_signal: JulietSignal,
+    text: &str,
+) -> Option<(JulietSignal, &'static str)> {
     let lower = text.to_ascii_lowercase();
     if lower.contains(".swarm-hug/email.txt") {
         return Some((JulietSignal::NeedsEmail, "email_request"));
@@ -1142,6 +1240,20 @@ fn guardrail_override_signal(text: &str) -> Option<(JulietSignal, &'static str)>
     {
         return Some((JulietSignal::BranchClarification, "branch_mismatch"));
     }
+
+    if matches!(
+        raw_signal,
+        JulietSignal::ResultsReview
+            | JulietSignal::ResultsComplete
+            | JulietSignal::BranchClarification
+    ) || lower.contains("here's the results:")
+        || lower.contains("rubric summary")
+        || lower.contains("winner branch")
+        || lower.contains("winning branch")
+    {
+        return None;
+    }
+
     if lower.contains("look at these tasks:")
         || (lower.contains("how many variations") && lower.contains("how many sprints"))
     {
@@ -1179,6 +1291,27 @@ fn classify_response_heuristic(text: &str) -> JulietSignal {
         return JulietSignal::Idle;
     }
     JulietSignal::Unknown
+}
+
+fn extract_winning_branch_from_results(text: &str) -> Option<String> {
+    let patterns = [
+        r#"(?im)\bwinning\s+branch(?:es)?\s*(?:is|are|:|=)\s*`?(?P<branch>[A-Za-z0-9._/\-]+)`?"#,
+        r#"(?im)\bwinner\s+branch\s*(?:is|:|=)\s*`?(?P<branch>[A-Za-z0-9._/\-]+)`?"#,
+        r#"(?im)\bwinner\s*(?:is|:|=)\s*`?(?P<branch>[A-Za-z0-9._/\-]+)`?"#,
+    ];
+
+    for pattern in patterns {
+        let re = Regex::new(pattern).unwrap();
+        if let Some(captures) = re.captures(text)
+            && let Some(branch) = captures.name("branch")
+        {
+            let branch = branch.as_str().trim().trim_matches('`').to_string();
+            if validate_target_branch(&branch).is_ok() {
+                return Some(branch);
+            }
+        }
+    }
+    None
 }
 
 fn repair_branches_and_respond(
@@ -1458,6 +1591,30 @@ mod tests {
     }
 
     #[test]
+    fn guardrail_does_not_override_results_review_to_task_review() {
+        let trace = classify_response_hybrid_with_raw(
+            JulietSignal::ResultsReview,
+            "here's the results: branch set done. how many variations and how many sprints should i run next?",
+            None,
+        );
+        assert_eq!(trace.raw_signal, JulietSignal::ResultsReview);
+        assert_eq!(trace.final_signal, JulietSignal::ResultsReview);
+        assert_eq!(trace.source, DecisionSource::Codex);
+    }
+
+    #[test]
+    fn guardrail_does_not_override_branch_clarification_to_task_review() {
+        let trace = classify_response_hybrid_with_raw(
+            JulietSignal::BranchClarification,
+            "branch clarification: branch differs from expected and how many variations/how many sprints should i run?",
+            None,
+        );
+        assert_eq!(trace.raw_signal, JulietSignal::BranchClarification);
+        assert_eq!(trace.final_signal, JulietSignal::BranchClarification);
+        assert_eq!(trace.source, DecisionSource::Codex);
+    }
+
+    #[test]
     fn fallback_trace_marks_classifier_error() {
         let trace = classify_response_hybrid_with_raw(
             JulietSignal::StillWorking,
@@ -1467,6 +1624,17 @@ mod tests {
         assert_eq!(trace.final_signal, JulietSignal::StillWorking);
         assert_eq!(trace.source, DecisionSource::HeuristicFallback);
         assert_eq!(trace.classifier_error.as_deref(), Some("codex unavailable"));
+    }
+
+    #[test]
+    fn extracts_winning_branch_from_results_text() {
+        let branch = extract_winning_branch_from_results(
+            "Rubric summary:\nwinning branch: feature/phase-1-webgl-foundation-try2",
+        );
+        assert_eq!(
+            branch.as_deref(),
+            Some("feature/phase-1-webgl-foundation-try2")
+        );
     }
 
     #[test]
