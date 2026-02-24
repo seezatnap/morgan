@@ -2,8 +2,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, ArgGroup, Parser};
@@ -12,6 +19,7 @@ use morgan::julietscript::{
     ScriptArtifactSpec, ScriptSpec, generate_script, lint_script, parse_execution_plans,
     validate_artifact_name, validate_target_branch,
 };
+use morgan::logging::{stderr_line, stdout_line};
 use morgan::orchestrator::{
     ExecuteScriptOptions, ReplayRunOptions, ReplaySummary, ResumeRunOptions, replay_run,
     resume_run, run_script,
@@ -19,12 +27,33 @@ use morgan::orchestrator::{
 use morgan::process_manager::{
     ENV_FOREGROUND_WORKER, ENV_MANAGER_ID, ENV_MANAGER_LOG_PATH, ENV_MANAGER_RECORD_PATH,
     ManagedProcessRecord, ManagedProcessStatus, ensure_manager_dirs, generate_manager_id,
-    is_foreground_worker, load_record, logs_dir, mark_current_process_exited,
+    is_foreground_worker, is_process_alive, load_record, logs_dir, mark_current_process_exited,
     mark_current_process_run_id, mark_current_process_running, record_path as manager_record_path,
     write_record,
 };
 use morgan::run_memory::now_unix_ms;
 use serde::{Deserialize, Serialize};
+
+static FOLLOW_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+type SignalHandler = usize;
+
+#[cfg(unix)]
+const SIGINT: i32 = 2;
+
+#[cfg(unix)]
+const SIG_ERR: SignalHandler = usize::MAX;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signum: i32, handler: SignalHandler) -> SignalHandler;
+}
+
+#[cfg(unix)]
+extern "C" fn follow_signal_handler(_: i32) {
+    FOLLOW_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -239,6 +268,11 @@ struct RunArgs {
     /// Maximum bytes read from each input file when generating embedded context.
     #[arg(long = "max-input-bytes", default_value_t = 12_000)]
     max_input_bytes: usize,
+    /// Follow the spawned worker logfile in this terminal.
+    ///
+    /// Press Ctrl-C to stop following; the worker keeps running in the background.
+    #[arg(long = "follow", default_value_t = false, action = ArgAction::SetTrue)]
+    follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -295,6 +329,11 @@ struct ExecuteArgs {
     /// Skip JulietScript lint validation before execution.
     #[arg(long = "skip-lint", default_value_t = false, action = ArgAction::SetTrue)]
     skip_lint: bool,
+    /// Follow the spawned worker logfile in this terminal.
+    ///
+    /// Press Ctrl-C to stop following; the worker keeps running in the background.
+    #[arg(long = "follow", default_value_t = false, action = ArgAction::SetTrue)]
+    follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -305,6 +344,11 @@ struct ResumeArgs {
     /// Run identifier printed in normal run/execute summaries.
     #[arg(long = "run-id")]
     run_id: String,
+    /// Follow the spawned worker logfile in this terminal.
+    ///
+    /// Press Ctrl-C to stop following; the worker keeps running in the background.
+    #[arg(long = "follow", default_value_t = false, action = ArgAction::SetTrue)]
+    follow: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -351,15 +395,16 @@ fn main() {
     let _ = mark_current_process_exited(exit_code);
 
     if let Err(err) = result {
-        eprintln!("morgan: {err:#}");
+        stderr_line(&format!("morgan: {err:#}"));
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let follow_logs = should_follow_logs(&cli);
     if should_run_in_background(&cli) && !is_foreground_worker() {
-        return spawn_background_worker(&cli);
+        return spawn_background_worker(&cli, follow_logs);
     }
     if is_foreground_worker() {
         let _ = mark_current_process_running();
@@ -376,6 +421,15 @@ fn run() -> Result<()> {
 
 fn should_run_in_background(cli: &Cli) -> bool {
     matches!(cli, Cli::Run(_) | Cli::Execute(_) | Cli::Resume(_))
+}
+
+fn should_follow_logs(cli: &Cli) -> bool {
+    match cli {
+        Cli::Run(args) => args.follow,
+        Cli::Execute(args) => args.follow,
+        Cli::Resume(args) => args.follow,
+        Cli::Generate(_) | Cli::Replay(_) => false,
+    }
 }
 
 fn managed_command_name(cli: &Cli) -> &'static str {
@@ -398,7 +452,7 @@ fn managed_project_root(cli: &Cli) -> PathBuf {
     }
 }
 
-fn spawn_background_worker(cli: &Cli) -> Result<()> {
+fn spawn_background_worker(cli: &Cli, follow_logs: bool) -> Result<()> {
     let raw_project_root = managed_project_root(cli);
     let project_root = raw_project_root
         .canonicalize()
@@ -446,6 +500,11 @@ fn spawn_background_worker(cli: &Cli) -> Result<()> {
         .env(ENV_MANAGER_ID, &manager_id)
         .env(ENV_MANAGER_LOG_PATH, &log_path)
         .env(ENV_MANAGER_RECORD_PATH, &record_path);
+    #[cfg(unix)]
+    if follow_logs {
+        // Follow mode should not forward terminal Ctrl-C into the worker.
+        child.process_group(0);
+    }
 
     let child = child
         .spawn()
@@ -462,17 +521,104 @@ fn spawn_background_worker(cli: &Cli) -> Result<()> {
     merged_record.updated_at_unix_ms = now_unix_ms();
     write_record(&record_path, &merged_record)?;
 
-    println!("Morgan started in background.");
-    println!("Manager ID: {}", merged_record.id);
-    println!("PID: {}", merged_record.pid);
-    println!("Command: {}", merged_record.command);
-    println!("Project root: {}", merged_record.project_root.display());
-    println!("Log: {}", merged_record.log_path.display());
-    println!(
+    stdout_line("Morgan started in background.");
+    stdout_line(&format!("Manager ID: {}", merged_record.id));
+    stdout_line(&format!("PID: {}", merged_record.pid));
+    stdout_line(&format!("Command: {}", merged_record.command));
+    stdout_line(&format!(
+        "Project root: {}",
+        merged_record.project_root.display()
+    ));
+    stdout_line(&format!("Log: {}", merged_record.log_path.display()));
+    stdout_line(&format!(
         "Use `morgan-manager --project-root {} status` to monitor.",
         project_root.display()
-    );
+    ));
+    if follow_logs {
+        follow_worker_log(
+            &merged_record.log_path,
+            merged_record.id.as_str(),
+            merged_record.pid,
+        )?;
+    }
     Ok(())
+}
+
+fn follow_worker_log(log_path: &Path, manager_id: &str, pid: u32) -> Result<()> {
+    install_follow_signal_handler()?;
+    FOLLOW_EXIT_REQUESTED.store(false, Ordering::SeqCst);
+
+    stdout_line(&format!(
+        "Following {}. Press Ctrl-C to stop following (worker will keep running).",
+        log_path.display()
+    ));
+
+    let file = fs::File::open(log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut idle_polls_after_exit = 0u8;
+
+    loop {
+        if follow_exit_requested() {
+            stdout_line(&format!(
+                "Stopped following log. Worker is still running in background. Manager ID: {} PID: {}",
+                manager_id, pid
+            ));
+            return Ok(());
+        }
+
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("failed to read {}", log_path.display()))?;
+        if bytes > 0 {
+            print!("{line}");
+            let _ = io::stdout().flush();
+            idle_polls_after_exit = 0;
+            continue;
+        }
+
+        if is_process_alive(pid) {
+            idle_polls_after_exit = 0;
+        } else {
+            idle_polls_after_exit = idle_polls_after_exit.saturating_add(1);
+            if idle_polls_after_exit >= 3 {
+                break;
+            }
+        }
+
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    stdout_line(&format!(
+        "Worker exited. Manager ID: {} PID: {}",
+        manager_id, pid
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_follow_signal_handler() -> Result<()> {
+    let previous = unsafe { signal(SIGINT, follow_signal_handler as SignalHandler) };
+    if previous == SIG_ERR {
+        bail!("failed to install SIGINT handler for --follow mode");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_follow_signal_handler() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn follow_exit_requested() -> bool {
+    FOLLOW_EXIT_REQUESTED.load(Ordering::SeqCst)
+}
+
+#[cfg(not(unix))]
+fn follow_exit_requested() -> bool {
+    false
 }
 
 fn run_generate(args: GenerateArgs) -> Result<()> {
@@ -509,7 +655,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     }
 
     let plans = parse_execution_plans(&script)?;
-    println!(
+    stdout_line(&format!(
         "Generated script at {}\nEngine: {}\nVariants: {}\nSprints: {}\nKeep best: {}\nArtifacts: {}",
         script_path.display(),
         args.engine,
@@ -517,7 +663,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         args.sprints.max(1),
         args.keep_best.max(1),
         plans.len()
-    );
+    ));
     Ok(())
 }
 
@@ -873,18 +1019,21 @@ fn slugify(input: &str) -> String {
 }
 
 fn print_summary(summary: &morgan::orchestrator::RunSummary) {
-    println!("Run ID: {}", summary.run_id);
-    println!("Script: {}", summary.script_path.display());
-    println!("PRD: {}", summary.prd_path.display());
-    println!("Completed: {}", summary.completed);
-    println!("Artifacts executed: {}", summary.artifact_runs.len());
+    stdout_line(&format!("Run ID: {}", summary.run_id));
+    stdout_line(&format!("Script: {}", summary.script_path.display()));
+    stdout_line(&format!("PRD: {}", summary.prd_path.display()));
+    stdout_line(&format!("Completed: {}", summary.completed));
+    stdout_line(&format!(
+        "Artifacts executed: {}",
+        summary.artifact_runs.len()
+    ));
     for artifact in &summary.artifact_runs {
         let execution_root = artifact
             .execution_root
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "(unknown)".to_string());
-        println!(
+        stdout_line(&format!(
             "- {} | {} -> {} | completed: {} | root: {} | prd: {}",
             artifact.artifact_name,
             artifact.source_branch,
@@ -892,33 +1041,33 @@ fn print_summary(summary: &morgan::orchestrator::RunSummary) {
             artifact.completed,
             execution_root,
             artifact.prd_path.display()
-        );
+        ));
     }
     if let Some(resume_id) = &summary.resume_id {
-        println!("Resume ID: {resume_id}");
+        stdout_line(&format!("Resume ID: {resume_id}"));
     }
-    println!("Turns: {}", summary.turns.len());
+    stdout_line(&format!("Turns: {}", summary.turns.len()));
     if let Some(last) = summary.turns.last() {
-        println!("Last signal: {:?}", last.signal);
-        println!("Last response:\n{}", last.received.trim());
+        stdout_line(&format!("Last signal: {:?}", last.signal));
+        stdout_line(&format!("Last response:\n{}", last.received.trim()));
     }
 }
 
 fn print_replay_summary(summary: &ReplaySummary) {
-    println!("Run ID: {}", summary.run_id);
-    println!("Turns replayed: {}", summary.total_turns);
-    println!("Changed decisions: {}", summary.changed_turns);
+    stdout_line(&format!("Run ID: {}", summary.run_id));
+    stdout_line(&format!("Turns replayed: {}", summary.total_turns));
+    stdout_line(&format!("Changed decisions: {}", summary.changed_turns));
     if summary.turns.is_empty() {
         return;
     }
 
-    println!("Per-turn drift:");
+    stdout_line("Per-turn drift:");
     for turn in &summary.turns {
         let changed = if turn.changed { "yes" } else { "no" };
-        println!(
+        stdout_line(&format!(
             "- {}#{} | original: {:?} | replayed: {:?} | changed: {}",
             turn.artifact_name, turn.turn, turn.original_signal, turn.replayed_signal, changed
-        );
+        ));
     }
 }
 

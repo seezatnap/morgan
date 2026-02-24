@@ -16,6 +16,8 @@ cargo run -- replay --help
 
 `run`, `execute`, and `resume` always spawn a background worker process.
 
+Add `--follow` to stream the worker logfile in the current terminal. Press `Ctrl-C` to stop following; the worker continues running in the background.
+
 Foreground output contains:
 
 - manager id (`mgr-...`)
@@ -81,6 +83,7 @@ Key options:
 - `--email <email>` value used for `.swarm-hug/email.txt` requests.
 - `--heartbeat-seconds <n>` polling cadence.
 - `--max-turns <n>` loop cap.
+- `--follow` stream worker logfile until completion or `Ctrl-C`.
 - `--auto-fix-branches <true|false>` branch repair behavior.
 - `--auto-grade <true|false>` grading prompts behavior.
 - `--juliet-bin <path>` explicit Juliet binary.
@@ -133,6 +136,7 @@ Key options:
 - `--email <email>`
 - `--heartbeat-seconds <n>`
 - `--max-turns <n>`
+- `--follow`
 - `--auto-fix-branches <true|false>`
 - `--auto-grade <true|false>`
 - `--juliet-bin <path>`
@@ -153,6 +157,7 @@ Required:
 Key options:
 
 - `--project-root <dir>` base containing `.morgan/runs`.
+- `--follow`
 
 ## `replay`
 
@@ -209,6 +214,7 @@ cargo run -- run \
   --project-name orchestrator \
   --master-prompt "Build and validate the orchestration CLI." \
   --input-file ../juliet/prds/init.md \
+  --follow \
   --source-branch main \
   --email you@example.com
 ```

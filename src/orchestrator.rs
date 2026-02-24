@@ -16,6 +16,7 @@ use crate::julietscript::{
     ExecutionPlan, ScriptArtifactSpec, ScriptSpec, build_create_prompt, generate_script,
     lint_script, parse_execution_plans, validate_artifact_name, validate_target_branch,
 };
+use crate::logging::stderr_line;
 use crate::preflight::{PreflightOptions, load_input_context, run_preflight};
 use crate::process_manager::{current_log_path, current_manager_id};
 use crate::run_memory::{
@@ -330,9 +331,9 @@ pub fn replay_run(options: ReplayRunOptions) -> Result<ReplaySummary> {
         .with_context(|| format!("failed to resolve {}", options.project_root.display()))?;
     let (_, state) = load_run_state(&project_root, &options.run_id)?;
     if let Err(err) = ensure_codex_ready(&state.project_root) {
-        eprintln!(
+        stderr_line(&format!(
             "morgan: warning: codex classifier readiness check failed during replay; using heuristic fallback where needed: {err:#}"
-        );
+        ));
     }
 
     let mut turn_summaries = Vec::with_capacity(state.turns.len());
@@ -581,9 +582,9 @@ fn run_with_plans(options: RunWithPlansOptions) -> Result<RunSummary> {
     }
     validate_dependency_order(&options.plans)?;
     if let Err(err) = ensure_codex_ready(&options.project_root) {
-        eprintln!(
+        stderr_line(&format!(
             "morgan: warning: codex classifier readiness check failed; continuing with heuristic fallback where needed: {err:#}"
-        );
+        ));
     }
 
     let juliet_runner = JulietRunner::discover(
@@ -860,10 +861,36 @@ fn run_single_artifact(
         .unwrap_or(1);
     for turn in starting_turn..=max_turns {
         let outbound = compose_turn_message(&next_instruction, plan, source_branch, target_branch);
+        log_lifecycle_event(
+            &plan.artifact_name,
+            turn,
+            "send",
+            &format!(
+                "resume_id={} instruction=\"{}\" outbound=\"{}\"",
+                resume_id.as_deref().unwrap_or("<new>"),
+                lifecycle_preview(&next_instruction, 200),
+                lifecycle_preview(&outbound, 260),
+            ),
+        );
         let response = client.exec_turn(plan.engine, &outbound, resume_id.as_deref())?;
         resume_id = Some(response.resume_id.clone());
         let decision = classify_response_hybrid(execution_root, &response.text);
         let signal = decision.final_signal;
+        log_lifecycle_event(
+            &plan.artifact_name,
+            turn,
+            "recv",
+            &format!(
+                "resume_id={} raw_signal={:?} final_signal={:?} source={:?} rule={} classifier_error={} response=\"{}\"",
+                response.resume_id,
+                decision.raw_signal,
+                signal,
+                decision.source,
+                decision.rule.as_deref().unwrap_or("-"),
+                decision.classifier_error.as_deref().unwrap_or("-"),
+                lifecycle_preview(&response.text, 260),
+            ),
+        );
 
         let turn_record = TurnRecord {
             artifact_name: plan.artifact_name.clone(),
@@ -881,6 +908,7 @@ fn run_single_artifact(
         turns.push(turn_record.clone());
 
         let mut should_break = false;
+        let decision_note;
         match signal {
             JulietSignal::NeedsEmail => {
                 let email = email.context(
@@ -890,33 +918,53 @@ fn run_single_artifact(
                     "use this email value for .swarm-hug/email.txt: {}",
                     email.trim()
                 );
+                decision_note = "provided_email_for_requested_file".to_string();
             }
             JulietSignal::NeedsTaskReview => {
                 next_instruction = format!(
                     "tasks look good. use {}. run {} variations and {} sprints. use source branch {} and target branch {}.",
                     plan.engine, plan.variants, plan.sprints, source_branch, target_branch
                 );
+                decision_note = "approved_tasks_and_requested_execution".to_string();
             }
             JulietSignal::StillWorking | JulietSignal::Unknown | JulietSignal::Idle => {
                 if turn < max_turns {
-                    thread::sleep(Duration::from_secs(heartbeat_seconds.max(1)));
+                    let sleep_seconds = heartbeat_seconds.max(1);
+                    log_lifecycle_event(
+                        &plan.artifact_name,
+                        turn,
+                        "heartbeat",
+                        &format!(
+                            "sleep_seconds={} next_instruction=\"status update please.\"",
+                            sleep_seconds
+                        ),
+                    );
+                    thread::sleep(Duration::from_secs(sleep_seconds));
                     next_instruction = "status update please.".to_string();
+                    decision_note =
+                        format!("waiting_for_progress_update_after_{sleep_seconds}s_heartbeat");
+                } else {
+                    decision_note = "max_turns_reached_without_completion".to_string();
                 }
             }
             JulietSignal::ResultsReview => {
                 if auto_grade {
                     next_instruction = "grade these results using your rubric, summarize winner branches, and continue to the next sprint if work remains.".to_string();
+                    decision_note = "requested_auto_grade_then_continue".to_string();
                 } else {
                     next_instruction = "looks good. continue to the next sprint.".to_string();
+                    decision_note = "approved_results_and_continue".to_string();
                 }
             }
             JulietSignal::ResultsComplete => {
                 if auto_grade && !final_grade_requested {
                     next_instruction = "before we finish, grade the final results with your rubric and summarize the winning branch.".to_string();
                     final_grade_requested = true;
+                    decision_note = "requested_final_grade_before_completion".to_string();
                 } else {
                     completed = true;
                     should_break = true;
+                    decision_note = "marked_artifact_complete".to_string();
                 }
             }
             JulietSignal::BranchClarification => {
@@ -926,8 +974,23 @@ fn run_single_artifact(
                     target_branch,
                     auto_fix_branches,
                 )?;
+                decision_note = "resolved_branch_clarification".to_string();
             }
         }
+        log_lifecycle_event(
+            &plan.artifact_name,
+            turn,
+            "decision",
+            &format!(
+                "signal={:?} action={} next_instruction=\"{}\" completed={} final_grade_requested={} should_break={}",
+                signal,
+                decision_note,
+                lifecycle_preview(&next_instruction, 200),
+                completed,
+                final_grade_requested,
+                should_break,
+            ),
+        );
 
         if let Some(run_tracker) = tracker.as_mut() {
             run_tracker.record_turn(
@@ -962,6 +1025,24 @@ fn run_single_artifact(
     }
 
     Ok(summary)
+}
+
+fn log_lifecycle_event(artifact_name: &str, turn: u32, stage: &str, detail: &str) {
+    stderr_line(&format!(
+        "morgan: lifecycle: artifact={} turn={} stage={} {}",
+        artifact_name, turn, stage, detail
+    ));
+}
+
+fn lifecycle_preview(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut truncated = compact.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn compose_turn_message(

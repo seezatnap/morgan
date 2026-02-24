@@ -3,6 +3,7 @@ pub mod engine;
 pub mod git;
 pub mod juliet;
 pub mod julietscript;
+pub mod logging;
 pub mod orchestrator;
 pub mod preflight;
 pub mod process_manager;

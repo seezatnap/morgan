@@ -37,23 +37,18 @@ pub fn ensure_codex_ready(cwd: &Path) -> Result<()> {
             _ => anyhow::anyhow!("failed to run `codex login status`: {err}"),
         })?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
     if !output.status.success() {
         bail!(
             "`codex login status` failed (exit {}):\n{}",
             output.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&output.stderr).trim()
+            combine_status_output(&stdout, &stderr)
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.contains("Logged in using") {
-        bail!(
-            "Codex is not ready. Expected `codex login status` to contain `Logged in using` but got:\n{}",
-            stdout.trim()
-        );
-    }
-
-    Ok(())
+    ensure_login_status_ready(&stdout, &stderr)
 }
 
 pub fn classify_juliet_output(cwd: &Path, juliet_output: &str) -> Result<CodexAction> {
@@ -148,6 +143,54 @@ fn map_action_label(label: &str) -> Result<CodexAction> {
     Ok(action)
 }
 
+fn combine_status_output(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "(no output)".to_string(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
+    }
+}
+
+fn ensure_login_status_ready(stdout: &str, stderr: &str) -> Result<()> {
+    let combined = combine_status_output(stdout, stderr);
+    if combined == "(no output)" {
+        // Treat successful but silent output as ready so CLI phrasing changes
+        // do not block orchestration.
+        return Ok(());
+    }
+
+    let lower = combined.to_ascii_lowercase();
+    if login_status_indicates_not_ready(&lower) {
+        bail!(
+            "Codex is not ready. `codex login status` indicates no active login:\n{}",
+            combined
+        );
+    }
+
+    // If login status succeeds and does not explicitly indicate a missing login,
+    // accept it as ready to avoid brittle coupling to exact wording.
+    Ok(())
+}
+
+fn login_status_indicates_not_ready(lower: &str) -> bool {
+    [
+        "not logged in",
+        "no active login",
+        "run codex login",
+        "run `codex login`",
+        "please log in",
+        "please login",
+        "sign in",
+        "not authenticated",
+        "authentication required",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +219,22 @@ mod tests {
 
         let message = extract_last_agent_message(stream).expect("agent message should exist");
         assert_eq!(message, r#"{"action":"needs_email"}"#);
+    }
+
+    #[test]
+    fn readiness_accepts_empty_success_output() {
+        assert!(ensure_login_status_ready("", "").is_ok());
+    }
+
+    #[test]
+    fn readiness_accepts_logged_in_output() {
+        assert!(ensure_login_status_ready("Logged in using API key", "").is_ok());
+    }
+
+    #[test]
+    fn readiness_rejects_not_logged_in_output() {
+        let err = ensure_login_status_ready("Not logged in. Run codex login.", "")
+            .expect_err("should reject missing login");
+        assert!(err.to_string().contains("indicates no active login"));
     }
 }
